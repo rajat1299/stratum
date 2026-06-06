@@ -123,10 +123,11 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("ReviewsScreen — chrome", () => {
-  it("always renders the title + phase label", async () => {
+  it("always renders the title + product label", async () => {
     renderWith(vi.fn<typeof fetch>(async () => okJson(EMPTY)));
     expect(await screen.findByRole("heading", { name: "Reviews" })).toBeTruthy();
-    expect(screen.getByText(/phase d/i)).toBeTruthy();
+    expect(screen.getByText(/review queue/i)).toBeTruthy();
+    expect(screen.queryByText(/phase/i)).toBeNull();
   });
 });
 

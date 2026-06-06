@@ -115,12 +115,12 @@ export function ReviewsScreen({ controller, hrefFor, onOpen }: ReviewsScreenProp
   const hasNoMatches = hasData && filtered.length === 0;
 
   return (
-    <div className="mx-auto max-w-3xl px-8 py-10">
+    <div className="mx-auto max-w-6xl px-6 py-6">
       <header className="mb-6">
         <div className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
-          Phase D — the daily driver
+          Review queue
         </div>
-        <h1 className="mt-1 text-[22px] font-medium leading-tight tracking-tight text-stone-900">
+        <h1 className="mt-1 text-[24px] font-medium leading-tight text-stone-950">
           Reviews
         </h1>
       </header>
@@ -176,11 +176,7 @@ function FilterToolbar({
   const searchId = useId();
   return (
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-      <div
-        role="radiogroup"
-        aria-label="Filter by status"
-        className="inline-flex rounded-md bg-stone-100 p-0.5"
-      >
+      <div role="radiogroup" aria-label="Filter by status" className="inline-flex rounded-[4px] border border-stone-200 bg-white p-0.5">
         {ALL_FILTERS.map((f) => (
           <FilterChip
             key={f}
@@ -217,7 +213,7 @@ function FilterToolbar({
           placeholder="Search by title, ref, or id…"
           autoComplete="off"
           spellCheck={false}
-          className="w-64 rounded-md border border-stone-200 bg-white py-1.5 pl-7 pr-2 text-[12.5px] text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-stone-400 focus:ring-2 focus:ring-stone-200"
+          className="w-72 rounded-[4px] border border-stone-200 bg-white py-1.5 pl-7 pr-2 text-[12.5px] text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-stone-950"
         />
       </label>
     </div>
@@ -241,16 +237,16 @@ function FilterChip({
       role="radio"
       aria-checked={active}
       onClick={onClick}
-      className={`flex items-center gap-1.5 rounded-[5px] px-2.5 py-1 text-[12px] font-medium transition ${
+      className={`flex items-center gap-1.5 rounded-[4px] px-2.5 py-1 text-[12px] font-medium transition ${
         active
-          ? "bg-white text-stone-900 shadow-sm ring-1 ring-stone-200"
+          ? "bg-stone-950 text-white"
           : "text-stone-600 hover:text-stone-900"
       }`}
     >
       <span className="capitalize">{filter}</span>
       <span
         className={`font-mono text-[10.5px] tabular-nums ${
-          active ? "text-stone-500" : "text-stone-400"
+          active ? "text-stone-300" : "text-stone-400"
         }`}
       >
         {count}
@@ -270,7 +266,7 @@ function LoadingState() {
         <li
           key={i}
           aria-hidden
-          className="animate-pulse rounded-md border border-stone-200 bg-white p-4 shadow-sm"
+          className="animate-pulse rounded-[4px] border border-stone-200 bg-white p-4"
         >
           <div className="mb-3 h-3 w-3/4 rounded bg-stone-200" />
           <div className="h-3 w-1/2 rounded bg-stone-100" />
@@ -282,11 +278,10 @@ function LoadingState() {
 
 function EmptyState() {
   return (
-    <div className="rounded-md border border-dashed border-stone-300 bg-white px-6 py-12 text-center shadow-sm">
+    <div className="rounded-[4px] border border-dashed border-stone-300 bg-white px-6 py-12 text-center">
       <h2 className="text-[15px] font-medium text-stone-900">No change requests yet.</h2>
-      <p className="mx-auto mt-1 max-w-sm font-serif text-[14px] italic text-stone-500">
-        When agents commit to a branch you review, they'll show up here with a diff, a rationale,
-        and one-click approve.
+      <p className="mx-auto mt-1 max-w-sm text-[13px] text-stone-500">
+        New reviews will appear here with the files, discussion, and decision controls in one place.
       </p>
     </div>
   );
@@ -294,15 +289,15 @@ function EmptyState() {
 
 function NoMatchesState({ onClear }: { readonly onClear: () => void }) {
   return (
-    <div className="rounded-md border border-stone-200 bg-white px-6 py-10 text-center shadow-sm">
+    <div className="rounded-[4px] border border-stone-200 bg-white px-6 py-10 text-center">
       <h2 className="text-[15px] font-medium text-stone-900">No matches.</h2>
-      <p className="mx-auto mt-1 max-w-sm font-serif text-[14px] italic text-stone-500">
+      <p className="mx-auto mt-1 max-w-sm text-[13px] text-stone-500">
         Nothing in this view matches your filter and search. Loosen one to see more.
       </p>
       <button
         type="button"
         onClick={onClear}
-        className="mt-4 rounded-md border border-stone-300 bg-white px-3 py-1 text-[12px] font-medium text-stone-700 transition hover:border-stone-500 hover:text-stone-900"
+        className="mt-4 rounded-[4px] border border-stone-300 bg-white px-3 py-1 text-[12px] font-medium text-stone-700 transition hover:border-stone-950 hover:text-stone-950"
       >
         Clear filters
       </button>
@@ -312,7 +307,7 @@ function NoMatchesState({ onClear }: { readonly onClear: () => void }) {
 
 function ErrorState({ error, onRetry }: { readonly error: Error | null; readonly onRetry: () => void }) {
   return (
-    <div role="alert" className="rounded-md border border-rose-200 bg-rose-50 px-5 py-4 shadow-sm">
+    <div role="alert" className="rounded-[4px] border border-rose-200 bg-rose-50 px-5 py-4">
       <div className="font-mono text-[10.5px] uppercase tracking-wider text-rose-700">
         Couldn't load change requests
       </div>
@@ -320,7 +315,7 @@ function ErrorState({ error, onRetry }: { readonly error: Error | null; readonly
       <button
         type="button"
         onClick={onRetry}
-        className="mt-3 rounded-md border border-rose-300 bg-white px-3 py-1 text-[12px] font-medium text-rose-800 transition hover:border-rose-500 hover:bg-rose-50"
+        className="mt-3 rounded-[4px] border border-rose-300 bg-white px-3 py-1 text-[12px] font-medium text-rose-800 transition hover:border-rose-500 hover:bg-rose-50"
       >
         Retry
       </button>
@@ -377,7 +372,7 @@ function ChangeRequestCard({
           onOpen(cr.id);
         }}
         aria-labelledby={`cr-title-${cr.id}`}
-        className="block rounded-md border border-stone-200 bg-white p-4 shadow-sm transition hover:border-stone-300 hover:shadow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-400"
+        className="block rounded-[4px] border border-stone-200 bg-white p-4 transition hover:border-stone-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-400"
       >
         {body}
       </a>
@@ -387,7 +382,7 @@ function ChangeRequestCard({
   // Default (test + non-routed) — no nav, no hover-cursor lie.
   return (
     <article
-      className="rounded-md border border-stone-200 bg-white p-4 shadow-sm transition hover:border-stone-300"
+      className="rounded-[4px] border border-stone-200 bg-white p-4 transition hover:border-stone-950"
       aria-labelledby={`cr-title-${cr.id}`}
     >
       {body}
@@ -427,7 +422,7 @@ function StatusBadge({
 }) {
   const { label, color } = badgeFor(status, approved);
   return (
-    <span className={`shrink-0 rounded-md px-2 py-0.5 font-mono text-[10.5px] uppercase tracking-wider ${color}`}>
+    <span className={`shrink-0 rounded-[4px] px-2 py-0.5 font-mono text-[10.5px] uppercase tracking-wider ${color}`}>
       {label}
     </span>
   );
@@ -437,10 +432,10 @@ function badgeFor(
   status: "open" | "merged" | "rejected",
   approved: boolean,
 ): { label: string; color: string } {
-  if (status === "merged") return { label: "merged", color: "bg-emerald-100 text-emerald-800" };
-  if (status === "rejected") return { label: "rejected", color: "bg-stone-200 text-stone-700" };
-  if (approved) return { label: "ready", color: "bg-orange-100 text-orange-800" };
-  return { label: "open", color: "bg-amber-100 text-amber-800" };
+  if (status === "merged") return { label: "merged", color: "border border-emerald-200 bg-emerald-50 text-emerald-800" };
+  if (status === "rejected") return { label: "rejected", color: "border border-stone-200 bg-stone-100 text-stone-700" };
+  if (approved) return { label: "ready", color: "border border-orange-200 bg-orange-50 text-orange-700" };
+  return { label: "open", color: "border border-stone-200 bg-white text-stone-700" };
 }
 
 function ActorMark({ agentish }: { readonly agentish: boolean }) {
@@ -448,21 +443,17 @@ function ActorMark({ agentish }: { readonly agentish: boolean }) {
     return (
       <span
         aria-hidden
-        className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-orange-100 font-mono text-[9px] font-semibold text-orange-700"
+        className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-orange-600"
         title="Agent-authored change request"
-      >
-        ag
-      </span>
+      />
     );
   }
   return (
     <span
       aria-hidden
-      className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-stone-200 font-mono text-[9px] font-semibold text-stone-700"
+      className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-stone-400"
       title="Human-authored change request"
-    >
-      hu
-    </span>
+    />
   );
 }
 
