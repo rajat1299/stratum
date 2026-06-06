@@ -26,6 +26,9 @@ import type {
   ApprovalResponse,
   ChangeRequestListResponse,
   ChangeRequestResponse,
+  CommentListResponse,
+  CommentRequest,
+  CommentResponse,
 } from "@stratum/sdk";
 import {
   useMutation,
@@ -51,6 +54,7 @@ export const reviewKeys = {
   list: () => [...reviewKeys.all, "list"] as const,
   detail: (id: string) => [...reviewKeys.all, "detail", id] as const,
   approvals: (id: string) => [...reviewKeys.all, "approvals", id] as const,
+  comments: (id: string) => [...reviewKeys.all, "comments", id] as const,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,6 +295,73 @@ export function useDismissApproval(): UseMutationResult<
       void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
       // Dismissed approval flips active→false in the list response.
       void queryClient.invalidateQueries({ queryKey: reviewKeys.approvals(vars.id) });
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// useComments / useCreateComment — D4
+//
+// Review comments serve two purposes today:
+//   - general                   reviewer's threaded discussion
+//   - changes_requested         signals "do not merge, please revise"
+//                               (the D2.2 "Request changes" button
+//                               becomes a one-click composer with this
+//                               kind pre-selected)
+// Both surface in the same thread; the kind drives visual treatment.
+//
+// Audit details strip the body intentionally — backend redacts comment
+// text from audit events. Components can safely show the body in the
+// thread; we never log it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the full comment thread for a CR. Includes both active and
+ * inactive (deleted-server-side; field is `active: boolean`). The
+ * thread component renders both, dimming inactive ones with their
+ * historical trail — same posture as the approvals list.
+ */
+export function useComments(id: string): UseQueryResult<CommentListResponse, Error> {
+  const client = useStratumClient();
+  return useQuery({
+    queryKey: reviewKeys.comments(id),
+    queryFn: () => client.reviews.listComments(id),
+    staleTime: 30_000,
+    retry: (failureCount, error) => !isTerminalHttpError(error) && failureCount < 2,
+  });
+}
+
+/**
+ * POST /change-requests/:id/comments — append a comment.
+ *
+ *   body  required, non-empty after trim, bounded by backend (~280 chars)
+ *   path  optional absolute path; pin a comment to a file
+ *   kind  optional, defaults to "general"; "changes_requested" is the
+ *         signal the merge button reads via the UI
+ *
+ * onSuccess invalidates the comments list. We don't touch the detail
+ * cache because creating a comment doesn't change approval_state —
+ * the rollup the detail screen renders stays valid.
+ */
+export function useCreateComment(): UseMutationResult<
+  CommentResponse,
+  Error,
+  { readonly id: string; readonly body: string; readonly path?: string; readonly kind?: "general" | "changes_requested" }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, body, path, kind }) => {
+      const idempotencyKey = newIdempotencyKey();
+      const request: CommentRequest = {
+        body,
+        ...(path !== undefined ? { path } : {}),
+        ...(kind !== undefined ? { kind } : {}),
+      };
+      return client.reviews.createComment(id, request, { idempotencyKey });
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.comments(vars.id) });
     },
   });
 }

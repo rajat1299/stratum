@@ -11,6 +11,8 @@ import {
   useChangeRequest,
   useChangeRequestList,
   useChangeRequests,
+  useComments,
+  useCreateComment,
   useDismissApproval,
   useMergeChangeRequest,
   useRejectChangeRequest,
@@ -98,11 +100,12 @@ function httpError(status: number, body: unknown = { error: "boom" }): Response 
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("reviewKeys — stable factory", () => {
-  it("list, detail, and approvals keys all start with the 'change-requests' root", () => {
+  it("list, detail, approvals, and comments keys all start with the 'change-requests' root", () => {
     expect(reviewKeys.all).toEqual(["change-requests"]);
     expect(reviewKeys.list()).toEqual(["change-requests", "list"]);
     expect(reviewKeys.detail("cr-42")).toEqual(["change-requests", "detail", "cr-42"]);
     expect(reviewKeys.approvals("cr-42")).toEqual(["change-requests", "approvals", "cr-42"]);
+    expect(reviewKeys.comments("cr-42")).toEqual(["change-requests", "comments", "cr-42"]);
   });
 });
 
@@ -464,5 +467,133 @@ describe("useApproveChangeRequest — also invalidates the approvals list", () =
     });
     const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
     expect(calledKeys).toContainEqual(reviewKeys.approvals("cr-1"));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D4 — Comments
+// ─────────────────────────────────────────────────────────────────────────────
+
+const COMMENT_LIST_RESPONSE = {
+  comments: [
+    {
+      id: "cmt-1",
+      change_request_id: "cr-1",
+      author: 42,
+      body: "Looks good — one nit on §3.2.",
+      path: null,
+      kind: "general" as const,
+      active: true,
+      version: 1,
+    },
+    {
+      id: "cmt-2",
+      change_request_id: "cr-1",
+      author: 7,
+      body: "Please update the summary before merge.",
+      path: "/contracts/loi-acme.docx",
+      kind: "changes_requested" as const,
+      active: true,
+      version: 1,
+    },
+  ],
+};
+
+const COMMENT_CREATE_RESPONSE = {
+  comment: {
+    id: "cmt-new",
+    change_request_id: "cr-1",
+    author: 1,
+    body: "ack",
+    path: null,
+    kind: "general" as const,
+    active: true,
+    version: 1,
+  },
+  created: true,
+};
+
+describe("useComments", () => {
+  it("GETs /change-requests/:id/comments and returns the parsed list", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(COMMENT_LIST_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useComments("cr-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.comments).toHaveLength(2);
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("change-requests/cr-1/comments");
+    expect(call[1]?.method).toBe("GET");
+  });
+
+  it("preserves the kind distinction so the thread can render badges", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(COMMENT_LIST_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useComments("cr-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const comments = result.current.data?.comments ?? [];
+    expect(comments[0]?.kind).toBe("general");
+    expect(comments[1]?.kind).toBe("changes_requested");
+    expect(comments[1]?.path).toBe("/contracts/loi-acme.docx");
+  });
+});
+
+describe("useCreateComment", () => {
+  it("POSTs to /change-requests/:id/comments with an Idempotency-Key + body", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(COMMENT_CREATE_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useCreateComment(), { wrapper: Wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        id: "cr-1",
+        body: "Approving subject to §3.2 revision",
+        kind: "changes_requested",
+      });
+    });
+
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("change-requests/cr-1/comments");
+    expect(call[1]?.method).toBe("POST");
+    expect(headerOf(call[1], "Idempotency-Key")).toMatch(/^[0-9a-f-]{20,}$/i);
+    const body = String(call[1]?.body);
+    expect(body).toContain("Approving subject to §3.2");
+    expect(body).toContain("changes_requested");
+  });
+
+  it("omits optional fields (path, kind) from the request body when not supplied", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(COMMENT_CREATE_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useCreateComment(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", body: "ack" });
+    });
+    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    expect(body).toEqual({ body: "ack" });
+  });
+
+  it("invalidates the comments list on success (so the new comment appears)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(COMMENT_CREATE_RESPONSE));
+    const { Wrapper, queryClient } = wrapAuthed(fetchSpy);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useCreateComment(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", body: "ack" });
+    });
+    const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(calledKeys).toContainEqual(reviewKeys.comments("cr-1"));
+  });
+
+  it("does NOT invalidate the detail cache (comments don't change approval_state)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(COMMENT_CREATE_RESPONSE));
+    const { Wrapper, queryClient } = wrapAuthed(fetchSpy);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useCreateComment(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", body: "ack" });
+    });
+    const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(calledKeys).not.toContainEqual(reviewKeys.detail("cr-1"));
   });
 });
