@@ -50,6 +50,15 @@ const OPEN_APPROVED: ChangeRequestResponse = {
   },
 };
 
+const OPEN_APPROVED_READY: ChangeRequestResponse = {
+  ...OPEN_APPROVED,
+  approval_state: {
+    ...OPEN_APPROVED.approval_state,
+    require_all_files_viewed: false,
+  },
+  require_all_files_viewed: false,
+};
+
 const MERGED: ChangeRequestResponse = {
   ...OPEN_PENDING,
   change_request: { ...OPEN_PENDING.change_request, status: "merged" },
@@ -321,33 +330,30 @@ describe("ChangeRequestDetail — action row (D3 wired)", () => {
     expect(reject.disabled).toBe(false);
     const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
     expect(merge.disabled).toBe(true);
-    expect(merge.title).toMatch(/approval requirements/i);
+    expect(merge.title).toMatch(/waiting for 1 approval/i);
     const requestChanges = screen.getByRole("button", { name: /request changes/i }) as HTMLButtonElement;
     expect(requestChanges.disabled).toBe(false);
   });
 
-  it("on an approved CR with require_all_files_viewed_default=true (manifest default): Merge gated with viewing tooltip", async () => {
-    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
-      requireAllViewed: true,
-    });
-    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
-    // Wait for capabilities to load so the gating kicks in.
-    await waitFor(() => {
-      const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
-      expect(merge.disabled).toBe(true);
-      expect(merge.title).toMatch(/viewed-file tracking/i);
-    });
-  });
-
-  it("on an approved CR with require_all_files_viewed_default=false: Merge enabled", async () => {
+  it("on an approved CR that requires all files viewed: Merge is gated by the CR response", async () => {
     renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
       requireAllViewed: false,
     });
     await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
-    await waitFor(() => {
-      const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
-      expect(merge.disabled).toBe(false);
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+    expect(merge.title).toMatch(/review every changed file/i);
+  });
+
+  it("on an approved CR with CR-level file viewing disabled: Merge is enabled and explains the exact advance", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED_READY)), {
+      requireAllViewed: true,
     });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(false);
+    expect(screen.getByText(/This will advance main from 00000000 to a4f9c1b2/i)).toBeTruthy();
+    expect(screen.getByText(/agent\/redline\/cr-1 must still point to a4f9c1b2/i)).toBeTruthy();
   });
 
   it("on a terminal CR (merged): every action disabled with a 'CR is merged' tooltip", async () => {

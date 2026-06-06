@@ -42,7 +42,6 @@ import {
   useAssignReviewer,
   useReviewers,
 } from "../lib/api/reviews.ts";
-import { useCapabilities } from "../lib/capabilities.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen
@@ -111,9 +110,7 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
       </header>
 
       <ActionRow
-        id={cr.id}
-        status={cr.status}
-        approved={approved}
+        item={item}
         onRequestChanges={() => setCommentComposer({ open: true, kind: "changes_requested" })}
       />
 
@@ -152,38 +149,29 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function ActionRow({
-  id,
-  status,
-  approved,
+  item,
   onRequestChanges,
 }: {
-  readonly id: string;
-  readonly status: "open" | "merged" | "rejected";
-  readonly approved: boolean;
+  readonly item: ChangeRequestResponse;
   readonly onRequestChanges: () => void;
 }) {
+  const cr = item.change_request;
+  const approval = item.approval_state;
+  const id = cr.id;
+  const status = cr.status;
+  const approved = "approved" in approval && approval.approved;
   const isTerminal = status !== "open";
   const approve = useApproveChangeRequest();
   const reject = useRejectChangeRequest();
   const merge = useMergeChangeRequest();
-  const capabilities = useCapabilities();
 
-  // Merge gating — driven by the manifest's default for now.
-  //
-  // TODO(coordination): when backend ships the resolved per-CR
-  // `require_all_files_viewed: bool` on GET /change-requests/:id (see
-  // .worktrees/v2-foundation/docs/plans/2026-05-17-pre-slice45-review-
-  // contract-coordination.md), swap this read for the CR-scoped value.
-  // The manifest default is correct policy posture for protected refs;
-  // the per-CR value will let path-rule overrides surface accurately.
-  const requireAllViewed =
-    capabilities.data?.protection.ref_rules.require_all_files_viewed_default ?? true;
-  // The detail screen doesn't yet track per-file viewed state (that
-  // lives in the C4 spike). When the protection rule requires it, we
-  // gate merge with an explanatory tooltip rather than offer a button
-  // the policy will reject.
-  const mergeBlockedByViewing = approved && requireAllViewed;
+  const mergeBlockedByViewing = approved && item.require_all_files_viewed;
   const canMerge = approved && !mergeBlockedByViewing && !isTerminal;
+  const mergeBlockedReason = mergeBlockReason({
+    approval,
+    approved,
+    mergeBlockedByViewing,
+  });
 
   const anyPending = approve.isPending || reject.isPending || merge.isPending;
   const firstError = approve.error ?? reject.error ?? merge.error;
@@ -207,11 +195,7 @@ function ActionRow({
           title={
             isTerminal
               ? `This CR is ${status} — actions are read-only.`
-              : !approved
-                ? "Merge unlocks once approval requirements are satisfied."
-                : mergeBlockedByViewing
-                  ? "Merge gated: the protected rule requires all files to be viewed. Viewed-file tracking on the detail screen ships with the diff display (waiting on GET /vcs/diff base+head params)."
-                  : undefined
+              : mergeBlockedReason
           }
           className="rounded-md border border-orange-300 bg-orange-500 px-3 py-1.5 text-[13px] font-medium text-white transition enabled:hover:bg-orange-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-300 disabled:text-stone-50 disabled:opacity-60"
         >
@@ -237,9 +221,47 @@ function ActionRow({
         </button>
       </div>
 
+      {!isTerminal && (
+        <p className="max-w-2xl text-[12.5px] leading-relaxed text-stone-500">
+          {canMerge ? (
+            <>
+              This will advance {cr.target_ref} from {shortHash(cr.base_commit)} to{" "}
+              {shortHash(cr.head_commit)}. {cr.source_ref} must still point to{" "}
+              {shortHash(cr.head_commit)}.
+            </>
+          ) : (
+            mergeBlockedReason
+          )}
+        </p>
+      )}
+
       {firstError && <ActionError error={firstError} />}
     </div>
   );
+}
+
+function mergeBlockReason({
+  approval,
+  approved,
+  mergeBlockedByViewing,
+}: {
+  readonly approval: ChangeRequestResponse["approval_state"];
+  readonly approved: boolean;
+  readonly mergeBlockedByViewing: boolean;
+}): string | undefined {
+  if (mergeBlockedByViewing) return "Review every changed file before merging.";
+  if (approved) return undefined;
+  if (!("approved" in approval)) return "Approval status is unavailable.";
+
+  if (approval.missing_required_reviewers.length > 0) {
+    const names = approval.missing_required_reviewers.map((uid) => `Reviewer ${uid}`).join(", ");
+    return `Waiting for ${names}.`;
+  }
+
+  const missing = Math.max(approval.required_approvals - approval.approval_count, 0);
+  if (missing > 0) return `Waiting for ${missing} approval${missing === 1 ? "" : "s"}.`;
+
+  return "Waiting for approval.";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1035,4 +1057,8 @@ function httpStatusFromError(error: unknown): number | null {
   if (!error || typeof error !== "object") return null;
   const status = (error as { status?: unknown }).status;
   return typeof status === "number" ? status : null;
+}
+
+function shortHash(hash: string): string {
+  return hash.slice(0, 8);
 }
