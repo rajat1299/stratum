@@ -101,6 +101,8 @@ interface RenderOptions {
   readonly requireAllViewed?: boolean;
   /** Override the response for GET /change-requests/:id/approvals (D3.4). */
   readonly approvalsResponse?: Response | (() => Response | Promise<Response>);
+  /** Override the response for GET /change-requests/:id/comments (D4). */
+  readonly commentsResponse?: Response | (() => Response | Promise<Response>);
 }
 
 const EMPTY_APPROVALS = () =>
@@ -109,11 +111,17 @@ const EMPTY_APPROVALS = () =>
     headers: { "content-type": "application/json" },
   });
 
+const EMPTY_COMMENTS = () =>
+  new Response(JSON.stringify({ comments: [], approval_state: OPEN_PENDING.approval_state }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+
 function renderDetail(
   primary: typeof globalThis.fetch | Response | (() => Response | Promise<Response>),
   opts: RenderOptions = {},
 ) {
-  const { id = "cr-1", onBack = vi.fn(), requireAllViewed = false, approvalsResponse } = opts;
+  const { id = "cr-1", onBack = vi.fn(), requireAllViewed = false, approvalsResponse, commentsResponse } = opts;
 
   // URL-aware fetch:
   //   /v1/capabilities          → manifest stub (configurable via opts)
@@ -129,6 +137,11 @@ function renderDetail(
       ? approvalsResponse
       : async () => (approvalsResponse instanceof Response ? approvalsResponse.clone() : approvalsResponse)
     : EMPTY_APPROVALS;
+  const commentsFn = commentsResponse
+    ? typeof commentsResponse === "function"
+      ? commentsResponse
+      : async () => (commentsResponse instanceof Response ? commentsResponse.clone() : commentsResponse)
+    : EMPTY_COMMENTS;
 
   globalThis.fetch = (async (input, init) => {
     const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
@@ -138,6 +151,7 @@ function renderDetail(
     // POST /approvals (approve / dismiss mutations) routes to `primary`
     // so existing mutation tests' stubs still drive that response.
     if (method === "GET" && url.includes("/approvals")) return approvalsFn();
+    if (method === "GET" && url.includes("/comments")) return commentsFn();
     return primaryFn(input, init);
   }) as typeof globalThis.fetch;
 
@@ -270,7 +284,7 @@ describe("ChangeRequestDetail — populated", () => {
 });
 
 describe("ChangeRequestDetail — action row (D3 wired)", () => {
-  it("on an open + unapproved CR: Approve + Reject enabled, Merge disabled (no approval), Request changes still D4", async () => {
+  it("on an open + unapproved CR: Approve, Reject, and Request changes enabled; Merge disabled (no approval)", async () => {
     renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)));
     await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
     const approve = screen.getByRole("button", { name: /^approve$/i }) as HTMLButtonElement;
@@ -280,10 +294,8 @@ describe("ChangeRequestDetail — action row (D3 wired)", () => {
     const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
     expect(merge.disabled).toBe(true);
     expect(merge.title).toMatch(/approval requirements/i);
-    // Request changes still pending D4 — visible but disabled.
     const requestChanges = screen.getByRole("button", { name: /request changes/i }) as HTMLButtonElement;
-    expect(requestChanges.disabled).toBe(true);
-    expect(requestChanges.title).toMatch(/D4/);
+    expect(requestChanges.disabled).toBe(false);
   });
 
   it("on an approved CR with require_all_files_viewed_default=true (manifest default): Merge gated with viewing tooltip", async () => {
@@ -487,5 +499,87 @@ describe("ChangeRequestDetail — approvals list (D3.4)", () => {
     // Form stays expanded so the user can retry; alert appears below it.
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.getByRole("textbox", { name: /dismissal reason/i })).toBeTruthy();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D4 — Comments thread + request changes
+// ─────────────────────────────────────────────────────────────────────────────
+
+const COMMENT_LIST = {
+  comments: [
+    {
+      id: "cmt-1",
+      change_request_id: "cr-1",
+      author: 42,
+      body: "Please align the cap with the insurance schedule.",
+      path: "/contracts/acme.md",
+      kind: "changes_requested" as const,
+      active: true,
+      version: 1,
+    },
+    {
+      id: "cmt-2",
+      change_request_id: "cr-1",
+      author: 101,
+      body: "Confirmed. I updated the cap language.",
+      path: null,
+      kind: "general" as const,
+      active: true,
+      version: 1,
+    },
+  ],
+  approval_state: OPEN_PENDING.approval_state,
+};
+
+function commentsListResponse(): Response {
+  return new Response(JSON.stringify(COMMENT_LIST), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+describe("ChangeRequestDetail — comments (D4)", () => {
+  it("renders the review thread with changes-requested and path markers", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      commentsResponse: commentsListResponse,
+    });
+    expect(await screen.findByRole("heading", { name: /^comments$/i })).toBeTruthy();
+    expect(screen.getByText(/align the cap/i)).toBeTruthy();
+    expect(screen.getByText(/changes requested/i)).toBeTruthy();
+    expect(screen.getByText("/contracts/acme.md")).toBeTruthy();
+    expect(screen.getByText(/updated the cap language/i)).toBeTruthy();
+  });
+
+  it("Request changes opens the composer and posts a changes_requested comment", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/comments") && init?.method === "POST") {
+        return okJson({
+          comment: { ...COMMENT_LIST.comments[0]!, id: "cmt-new", body: "Please narrow the carve-out." },
+          created: true,
+          approval_state: OPEN_PENDING.approval_state,
+        });
+      }
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+
+    fireEvent.click(screen.getByRole("button", { name: /request changes/i }));
+    const composer = screen.getByRole("textbox", { name: /comment/i });
+    fireEvent.change(composer, { target: { value: "Please narrow the carve-out." } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+
+    await waitFor(() => {
+      const call = detailFetch.mock.calls.find(([u]) => String(u).includes("/comments"));
+      expect(call).toBeTruthy();
+      expect(call?.[1]?.method).toBe("POST");
+      expect(String(call?.[1]?.body)).toContain("Please narrow the carve-out.");
+      expect(String(call?.[1]?.body)).toContain("changes_requested");
+    });
   });
 });

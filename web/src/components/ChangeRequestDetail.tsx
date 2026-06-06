@@ -22,12 +22,19 @@
  *   Populated      full layout
  */
 
-import type { ApprovalRecord, ChangeRequest, ChangeRequestResponse } from "@stratum/sdk";
+import type {
+  ApprovalRecord,
+  ChangeRequest,
+  ChangeRequestResponse,
+  ReviewComment,
+} from "@stratum/sdk";
 import { useState } from "react";
 import {
   useApprovals,
   useApproveChangeRequest,
   useChangeRequest,
+  useComments,
+  useCreateComment,
   useDismissApproval,
   useMergeChangeRequest,
   useRejectChangeRequest,
@@ -72,6 +79,10 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
   const cr = item.change_request;
   const approval = item.approval_state;
   const approved = "approved" in approval && approval.approved;
+  const [commentComposer, setCommentComposer] = useState<CommentComposerState>({
+    open: false,
+    kind: "general",
+  });
 
   return (
     <article aria-labelledby="cr-detail-title">
@@ -96,7 +107,12 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
         <StatusBadges status={cr.status} approved={approved} />
       </header>
 
-      <ActionRow id={cr.id} status={cr.status} approved={approved} />
+      <ActionRow
+        id={cr.id}
+        status={cr.status}
+        approved={approved}
+        onRequestChanges={() => setCommentComposer({ open: true, kind: "changes_requested" })}
+      />
 
       {cr.description !== null && cr.description.length > 0 && (
         <section aria-labelledby="cr-detail-desc" className="mt-8">
@@ -114,6 +130,13 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
 
       <ApprovalDetail item={item} />
 
+      <CommentsThread
+        crId={cr.id}
+        composer={commentComposer}
+        isReadOnly={cr.status !== "open"}
+        onComposerChange={setCommentComposer}
+      />
+
       <DiffPlaceholder cr={cr} />
     </article>
   );
@@ -127,10 +150,12 @@ function ActionRow({
   id,
   status,
   approved,
+  onRequestChanges,
 }: {
   readonly id: string;
   readonly status: "open" | "merged" | "rejected";
   readonly approved: boolean;
+  readonly onRequestChanges: () => void;
 }) {
   const isTerminal = status !== "open";
   const approve = useApproveChangeRequest();
@@ -189,14 +214,12 @@ function ActionRow({
         </button>
         <button
           type="button"
-          disabled
-          title="Review comments (including 'Request changes') ship in slice D4."
-          className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={onRequestChanges}
+          disabled={isTerminal || anyPending}
+          title={isTerminal ? `This CR is ${status} — actions are read-only.` : undefined}
+          className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition enabled:hover:border-stone-500 enabled:hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-40"
         >
           Request changes
-          <span className="ml-1.5 font-mono text-[9.5px] uppercase tracking-wider text-stone-500">
-            D4
-          </span>
         </button>
         <button
           type="button"
@@ -211,6 +234,201 @@ function ActionRow({
 
       {firstError && <ActionError error={firstError} />}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Comments thread + request-changes composer
+// ─────────────────────────────────────────────────────────────────────────────
+
+type CommentKind = "general" | "changes_requested";
+
+interface CommentComposerState {
+  readonly open: boolean;
+  readonly kind: CommentKind;
+}
+
+function CommentsThread({
+  crId,
+  composer,
+  isReadOnly,
+  onComposerChange,
+}: {
+  readonly crId: string;
+  readonly composer: CommentComposerState;
+  readonly isReadOnly: boolean;
+  readonly onComposerChange: (state: CommentComposerState) => void;
+}) {
+  const q = useComments(crId);
+  const create = useCreateComment();
+  const [body, setBody] = useState("");
+
+  const trimmedBody = body.trim();
+
+  return (
+    <section aria-labelledby="cr-detail-comments" className="mt-8">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <h2
+          id="cr-detail-comments"
+          className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500"
+        >
+          Comments
+        </h2>
+        {!isReadOnly && (
+          <button
+            type="button"
+            onClick={() => onComposerChange({ open: true, kind: "general" })}
+            className="rounded-md border border-stone-300 px-2 py-0.5 font-mono text-[11px] text-stone-600 transition enabled:hover:border-stone-500 enabled:hover:text-stone-900"
+          >
+            Add note
+          </button>
+        )}
+      </div>
+
+      {q.isLoading && (
+        <div
+          aria-busy="true"
+          aria-label="Loading comments"
+          className="h-[72px] animate-pulse rounded-md border border-stone-200 bg-stone-50"
+        />
+      )}
+
+      {q.isError && (
+        <p
+          role="alert"
+          className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 font-mono text-[11.5px] text-rose-800"
+        >
+          Couldn't load comments: {q.error?.message ?? "unknown error"}
+        </p>
+      )}
+
+      {q.isSuccess && (
+        <div className="overflow-hidden rounded-md border border-stone-200 bg-white shadow-sm">
+          {q.data.comments.length === 0 ? (
+            <p className="px-4 py-3 text-[13px] text-stone-500">No comments yet.</p>
+          ) : (
+            <ul className="divide-y divide-stone-100">
+              {q.data.comments.map((comment) => (
+                <li key={comment.id}>
+                  <CommentRow comment={comment} />
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {composer.open && !isReadOnly && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!trimmedBody) return;
+            create.mutate(
+              { id: crId, body: trimmedBody, kind: composer.kind },
+              {
+                onSuccess: () => {
+                  setBody("");
+                  onComposerChange({ open: false, kind: "general" });
+                },
+              },
+            );
+          }}
+          className="mt-2 rounded-md border border-stone-200 bg-stone-50 px-3 py-3"
+        >
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <label
+              htmlFor="cr-comment-body"
+              className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500"
+            >
+              Comment
+            </label>
+            <span
+              className={`rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                composer.kind === "changes_requested"
+                  ? "bg-orange-100 text-orange-800"
+                  : "bg-stone-100 text-stone-500"
+              }`}
+            >
+              {composer.kind === "changes_requested" ? "changes requested" : "note"}
+            </span>
+          </div>
+          <textarea
+            id="cr-comment-body"
+            autoFocus
+            value={body}
+            onChange={(e) => setBody(e.currentTarget.value)}
+            maxLength={280}
+            disabled={create.isPending}
+            className="min-h-[86px] w-full resize-y rounded-md border border-stone-300 bg-white px-3 py-2 text-[13px] leading-relaxed text-stone-900 outline-none transition focus:border-stone-500 focus:ring-2 focus:ring-stone-200 disabled:opacity-50"
+          />
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="submit"
+              disabled={create.isPending || !trimmedBody}
+              className="rounded-md border border-stone-900 bg-stone-900 px-3 py-1.5 text-[12.5px] font-medium text-stone-50 transition enabled:hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {create.isPending ? "Sending..." : "Send"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                create.reset();
+                setBody("");
+                onComposerChange({ open: false, kind: "general" });
+              }}
+              disabled={create.isPending}
+              className="rounded-md border border-stone-300 px-3 py-1.5 text-[12.5px] font-medium text-stone-600 transition enabled:hover:border-stone-500 enabled:hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Cancel
+            </button>
+          </div>
+          {create.error && (
+            <p
+              role="alert"
+              className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2 py-1 font-mono text-[11px] text-rose-800"
+            >
+              {create.error.message}
+            </p>
+          )}
+        </form>
+      )}
+    </section>
+  );
+}
+
+function CommentRow({ comment }: { readonly comment: ReviewComment }) {
+  const isChangesRequested = comment.kind === "changes_requested";
+  return (
+    <article
+      className={`px-4 py-3 text-[13px] ${comment.active ? "text-stone-800" : "text-stone-400"}`}
+    >
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
+        <span>Reviewer {comment.author}</span>
+        <span aria-hidden className="text-stone-300">
+          ·
+        </span>
+        <span className={isChangesRequested ? "text-orange-700" : "text-stone-500"}>
+          {isChangesRequested ? "changes requested" : "note"}
+        </span>
+        {comment.path !== null && (
+          <>
+            <span aria-hidden className="text-stone-300">
+              ·
+            </span>
+            <span className="normal-case tracking-normal text-stone-600">{comment.path}</span>
+          </>
+        )}
+        {!comment.active && (
+          <>
+            <span aria-hidden className="text-stone-300">
+              ·
+            </span>
+            <span>removed</span>
+          </>
+        )}
+      </div>
+      <p className="mt-1 whitespace-pre-wrap leading-relaxed">{comment.body}</p>
+    </article>
   );
 }
 
