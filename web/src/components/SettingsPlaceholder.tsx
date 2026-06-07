@@ -6,6 +6,7 @@ import type {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { useAuth } from "../lib/auth.tsx";
+import { useCapabilities } from "../lib/capabilities.ts";
 import { useStratumClient } from "../lib/stratum-client.ts";
 
 const settingsKeys = {
@@ -18,19 +19,29 @@ export function SettingsPlaceholder() {
   const auth = useAuth();
   const client = useStratumClient();
   const queryClient = useQueryClient();
+  const capabilities = useCapabilities();
+  const settingsKnown = capabilities.data !== undefined;
+  const workspaceListAvailable = capabilities.data?.routes.workspaces.list.available === true;
+  const workspaceCreateAvailable = capabilities.data?.routes.workspaces.create.available === true;
+  const workspaceTokenAvailable = capabilities.data?.routes.workspaces.issue_token.available === true;
+  const refRulesAvailable = capabilities.data?.protection.ref_rules.available === true;
+  const pathRulesAvailable = capabilities.data?.protection.path_rules.available === true;
   const workspaces = useQuery({
     queryKey: settingsKeys.workspaces,
     queryFn: () => client.workspaces.list(),
+    enabled: workspaceListAvailable,
     staleTime: 15_000,
   });
   const protectedRefs = useQuery({
     queryKey: settingsKeys.protectedRefs,
     queryFn: () => client.reviews.listProtectedRefs(),
+    enabled: refRulesAvailable,
     staleTime: 15_000,
   });
   const protectedPaths = useQuery({
     queryKey: settingsKeys.protectedPaths,
     queryFn: () => client.reviews.listProtectedPaths(),
+    enabled: pathRulesAvailable,
     staleTime: 15_000,
   });
 
@@ -62,17 +73,32 @@ export function SettingsPlaceholder() {
   const [pathStatus, setPathStatus] = useState<string | null>(null);
   const [issuedToken, setIssuedToken] = useState<IssueWorkspaceTokenResponse | null>(null);
 
-  const workspaceList = workspaces.data?.workspaces ?? [];
+  const workspaceList = workspaceListAvailable ? (workspaces.data?.workspaces ?? []) : [];
+  const protectedRefRules = refRulesAvailable ? (protectedRefs.data?.rules ?? []) : [];
+  const protectedPathRules = pathRulesAvailable ? (protectedPaths.data?.rules ?? []) : [];
   const selectedWorkspaceId = tokenForm.workspaceId || workspaceList[0]?.id || "";
-  const firstError = workspaces.error ?? protectedRefs.error ?? protectedPaths.error;
+  const firstError =
+    capabilities.error ??
+    (workspaceListAvailable ? workspaces.error : null) ??
+    (refRulesAvailable ? protectedRefs.error : null) ??
+    (pathRulesAvailable ? protectedPaths.error : null);
+  const loadingSettings = capabilities.isLoading;
+  const settingsLoadFailed = !loadingSettings && !settingsKnown;
 
   const createWorkspace = useMutation({
-    mutationFn: () =>
-      client.workspaces.create({
+    mutationFn: () => {
+      if (!settingsKnown) {
+        throw new Error("Settings could not be loaded.");
+      }
+      if (!workspaceCreateAvailable) {
+        throw new Error("Workspace setup is not available in this hosted preview.");
+      }
+      return client.workspaces.create({
         name: workspaceForm.name.trim(),
         root_path: workspaceForm.rootPath.trim(),
         ...(workspaceForm.baseRef.trim() ? { base_ref: workspaceForm.baseRef.trim() } : {}),
-      }),
+      });
+    },
     onSuccess: async () => {
       setWorkspaceStatus("Workspace ready.");
       setWorkspaceForm({ name: "", rootPath: "", baseRef: "main" });
@@ -81,13 +107,20 @@ export function SettingsPlaceholder() {
   });
 
   const issueToken = useMutation({
-    mutationFn: () =>
-      client.workspaces.issueToken(selectedWorkspaceId, {
+    mutationFn: () => {
+      if (!settingsKnown) {
+        throw new Error("Settings could not be loaded.");
+      }
+      if (!workspaceTokenAvailable) {
+        throw new Error("Access token issuance is not available in this hosted preview.");
+      }
+      return client.workspaces.issueToken(selectedWorkspaceId, {
         name: tokenForm.name.trim(),
         agent_token: tokenForm.agentToken.trim(),
         read_prefixes: parsePrefixes(tokenForm.readPrefixes),
         write_prefixes: parsePrefixes(tokenForm.writePrefixes),
-      }),
+      });
+    },
     onSuccess: (response) => {
       setIssuedToken(response);
       setTokenForm((current) => ({
@@ -101,12 +134,19 @@ export function SettingsPlaceholder() {
   });
 
   const createBranchRule = useMutation({
-    mutationFn: () =>
-      client.reviews.createProtectedRef({
+    mutationFn: () => {
+      if (!settingsKnown) {
+        throw new Error("Settings could not be loaded.");
+      }
+      if (!refRulesAvailable) {
+        throw new Error("Branch protection is not available here.");
+      }
+      return client.reviews.createProtectedRef({
         ref_name: branchForm.refName.trim(),
         required_approvals: positiveInt(branchForm.approvals),
         require_all_files_viewed: branchForm.requireFiles,
-      }),
+      });
+    },
     onSuccess: async () => {
       setBranchStatus("Branch protected.");
       await queryClient.invalidateQueries({ queryKey: settingsKeys.protectedRefs });
@@ -114,13 +154,20 @@ export function SettingsPlaceholder() {
   });
 
   const createPathRule = useMutation({
-    mutationFn: () =>
-      client.reviews.createProtectedPath({
+    mutationFn: () => {
+      if (!settingsKnown) {
+        throw new Error("Settings could not be loaded.");
+      }
+      if (!pathRulesAvailable) {
+        throw new Error("Path protection is not available here.");
+      }
+      return client.reviews.createProtectedPath({
         path_prefix: pathForm.pathPrefix.trim(),
         ...(pathForm.targetRef.trim() ? { target_ref: pathForm.targetRef.trim() } : {}),
         required_approvals: positiveInt(pathForm.approvals),
         require_all_files_viewed: pathForm.requireFiles,
-      }),
+      });
+    },
     onSuccess: async () => {
       setPathStatus("Path protected.");
       await queryClient.invalidateQueries({ queryKey: settingsKeys.protectedPaths });
@@ -160,23 +207,33 @@ export function SettingsPlaceholder() {
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_390px]">
         <div className="space-y-4">
           <Panel title="Workspaces" meta={`${workspaceList.length}`}>
-            {workspaces.isLoading ? (
+            {loadingSettings ? (
+              <LoadingRows label="Loading settings" />
+            ) : settingsLoadFailed ? (
+              <UnavailableMessage>Settings could not be loaded.</UnavailableMessage>
+            ) : !workspaceListAvailable ? (
+              <UnavailableMessage>Workspace setup is not available in this hosted preview.</UnavailableMessage>
+            ) : workspaces.isLoading ? (
               <LoadingRows label="Loading workspaces" />
             ) : (
               <WorkspaceList workspaces={workspaceList} />
             )}
           </Panel>
 
-          <Panel
-            title="Rules"
-            meta={`${(protectedRefs.data?.rules.length ?? 0) + (protectedPaths.data?.rules.length ?? 0)}`}
-          >
+          <Panel title="Rules" meta={`${protectedRefRules.length + protectedPathRules.length}`}>
             <div className="grid gap-3 lg:grid-cols-2">
               <RuleList
                 title="Branches"
                 empty="No branch rules."
-                loading={protectedRefs.isLoading}
-                rules={(protectedRefs.data?.rules ?? []).map((rule) => ({
+                loading={loadingSettings || (settingsKnown && refRulesAvailable && protectedRefs.isLoading)}
+                unavailable={
+                  settingsLoadFailed
+                    ? "Settings could not be loaded."
+                    : !loadingSettings && settingsKnown && !refRulesAvailable
+                      ? "Branch protection is not available here."
+                      : undefined
+                }
+                rules={protectedRefRules.map((rule) => ({
                   id: rule.id,
                   name: rule.ref_name,
                   detail: approvalLabel(rule.required_approvals),
@@ -186,8 +243,15 @@ export function SettingsPlaceholder() {
               <RuleList
                 title="Paths"
                 empty="No path rules."
-                loading={protectedPaths.isLoading}
-                rules={(protectedPaths.data?.rules ?? []).map((rule) => ({
+                loading={loadingSettings || (settingsKnown && pathRulesAvailable && protectedPaths.isLoading)}
+                unavailable={
+                  settingsLoadFailed
+                    ? "Settings could not be loaded."
+                    : !loadingSettings && settingsKnown && !pathRulesAvailable
+                      ? "Path protection is not available here."
+                      : undefined
+                }
+                rules={protectedPathRules.map((rule) => ({
                   id: rule.id,
                   name: rule.path_prefix,
                   detail: pathRuleDetail(rule),
@@ -200,169 +264,217 @@ export function SettingsPlaceholder() {
 
         <aside className="space-y-4">
           <Panel title="New workspace">
-            <form className="space-y-3" onSubmit={(event) => submit(event, createWorkspace.mutate)}>
-              <TextField
-                label="Workspace name"
-                value={workspaceForm.name}
-                onChange={(value) => setWorkspaceForm((current) => ({ ...current, name: value }))}
-                placeholder="Deal room"
-                required
-              />
-              <TextField
-                label="Workspace path"
-                value={workspaceForm.rootPath}
-                onChange={(value) => setWorkspaceForm((current) => ({ ...current, rootPath: value }))}
-                placeholder="/contracts"
-                required
-              />
-              <TextField
-                label="Base branch"
-                value={workspaceForm.baseRef}
-                onChange={(value) => setWorkspaceForm((current) => ({ ...current, baseRef: value }))}
-                placeholder="main"
-              />
-              <ActionButton loading={createWorkspace.isPending}>Create workspace</ActionButton>
-              <MutationState
-                status={workspaceStatus}
-                error={createWorkspace.error}
-                loading={createWorkspace.isPending}
-              />
-            </form>
+            {loadingSettings ? (
+              <LoadingRows label="Loading workspace setup" rows={2} />
+            ) : settingsLoadFailed ? (
+              <UnavailableMessage>Settings could not be loaded.</UnavailableMessage>
+            ) : !workspaceCreateAvailable ? (
+              <UnavailableMessage>Workspace setup is not available in this hosted preview.</UnavailableMessage>
+            ) : (
+              <form className="space-y-3" onSubmit={(event) => submit(event, createWorkspace.mutate)}>
+                <TextField
+                  label="Workspace name"
+                  value={workspaceForm.name}
+                  onChange={(value) => setWorkspaceForm((current) => ({ ...current, name: value }))}
+                  placeholder="Deal room"
+                  required
+                />
+                <TextField
+                  label="Workspace path"
+                  value={workspaceForm.rootPath}
+                  onChange={(value) =>
+                    setWorkspaceForm((current) => ({ ...current, rootPath: value }))
+                  }
+                  placeholder="/contracts"
+                  required
+                />
+                <TextField
+                  label="Base branch"
+                  value={workspaceForm.baseRef}
+                  onChange={(value) => setWorkspaceForm((current) => ({ ...current, baseRef: value }))}
+                  placeholder="main"
+                />
+                <ActionButton loading={createWorkspace.isPending}>Create workspace</ActionButton>
+                <MutationState
+                  status={workspaceStatus}
+                  error={createWorkspace.error}
+                  loading={createWorkspace.isPending}
+                />
+              </form>
+            )}
           </Panel>
 
           <Panel title="Access token">
-            <form className="space-y-3" onSubmit={(event) => submit(event, issueToken.mutate)}>
-              <label className="block">
-                <span className="mb-1 block font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
-                  Workspace
-                </span>
-                <select
-                  value={selectedWorkspaceId}
-                  onChange={(event) =>
-                    setTokenForm((current) => ({ ...current, workspaceId: event.target.value }))
-                  }
-                  className={inputClassName}
-                  disabled={workspaceList.length === 0}
+            {loadingSettings ? (
+              <LoadingRows label="Loading token setup" rows={2} />
+            ) : settingsLoadFailed ? (
+              <UnavailableMessage>Settings could not be loaded.</UnavailableMessage>
+            ) : !workspaceListAvailable || !workspaceTokenAvailable ? (
+              <UnavailableMessage>
+                Access token issuance is not available in this hosted preview.
+              </UnavailableMessage>
+            ) : (
+              <form className="space-y-3" onSubmit={(event) => submit(event, issueToken.mutate)}>
+                <label className="block">
+                  <span className="mb-1 block font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
+                    Workspace
+                  </span>
+                  <select
+                    value={selectedWorkspaceId}
+                    onChange={(event) =>
+                      setTokenForm((current) => ({ ...current, workspaceId: event.target.value }))
+                    }
+                    className={inputClassName}
+                    disabled={workspaceList.length === 0}
+                    required
+                  >
+                    {workspaceList.map((workspace) => (
+                      <option key={workspace.id} value={workspace.id}>
+                        {workspace.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <TextField
+                  label="Token name"
+                  value={tokenForm.name}
+                  onChange={(value) => setTokenForm((current) => ({ ...current, name: value }))}
+                  placeholder="Review bot"
                   required
-                >
-                  {workspaceList.map((workspace) => (
-                    <option key={workspace.id} value={workspace.id}>
-                      {workspace.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <TextField
-                label="Token name"
-                value={tokenForm.name}
-                onChange={(value) => setTokenForm((current) => ({ ...current, name: value }))}
-                placeholder="Review bot"
-                required
-              />
-              <TextField
-                label="Agent token"
-                value={tokenForm.agentToken}
-                onChange={(value) => setTokenForm((current) => ({ ...current, agentToken: value }))}
-                placeholder="Paste once"
-                type="password"
-                required
-              />
-              <TextField
-                label="Read access"
-                value={tokenForm.readPrefixes}
-                onChange={(value) => setTokenForm((current) => ({ ...current, readPrefixes: value }))}
-                placeholder="/contracts"
-              />
-              <TextField
-                label="Write access"
-                value={tokenForm.writePrefixes}
-                onChange={(value) => setTokenForm((current) => ({ ...current, writePrefixes: value }))}
-                placeholder="/contracts/redlines"
-              />
-              <ActionButton loading={issueToken.isPending} disabled={!selectedWorkspaceId}>
-                Issue token
-              </ActionButton>
-              <MutationState error={issueToken.error} loading={issueToken.isPending} />
-              {issuedToken && (
-                <div className="rounded-[4px] border border-orange-200 bg-orange-50 px-3 py-2">
-                  <div className="font-mono text-[10.5px] uppercase tracking-wider text-orange-700">
-                    Token
+                />
+                <TextField
+                  label="Agent token"
+                  value={tokenForm.agentToken}
+                  onChange={(value) => setTokenForm((current) => ({ ...current, agentToken: value }))}
+                  placeholder="Paste once"
+                  type="password"
+                  required
+                />
+                <TextField
+                  label="Read access"
+                  value={tokenForm.readPrefixes}
+                  onChange={(value) =>
+                    setTokenForm((current) => ({ ...current, readPrefixes: value }))
+                  }
+                  placeholder="/contracts"
+                />
+                <TextField
+                  label="Write access"
+                  value={tokenForm.writePrefixes}
+                  onChange={(value) =>
+                    setTokenForm((current) => ({ ...current, writePrefixes: value }))
+                  }
+                  placeholder="/contracts/redlines"
+                />
+                <ActionButton loading={issueToken.isPending} disabled={!selectedWorkspaceId}>
+                  Issue token
+                </ActionButton>
+                <MutationState error={issueToken.error} loading={issueToken.isPending} />
+                {issuedToken && (
+                  <div className="rounded-[4px] border border-orange-200 bg-orange-50 px-3 py-2">
+                    <div className="font-mono text-[10.5px] uppercase tracking-wider text-orange-700">
+                      Token
+                    </div>
+                    <div className="mt-1 break-all font-mono text-[12px] text-stone-950">
+                      {issuedToken.workspace_token}
+                    </div>
                   </div>
-                  <div className="mt-1 break-all font-mono text-[12px] text-stone-950">
-                    {issuedToken.workspace_token}
-                  </div>
-                </div>
-              )}
-            </form>
+                )}
+              </form>
+            )}
           </Panel>
 
           <Panel title="Protect branch">
-            <form className="space-y-3" onSubmit={(event) => submit(event, createBranchRule.mutate)}>
-              <TextField
-                label="Branch name"
-                value={branchForm.refName}
-                onChange={(value) => setBranchForm((current) => ({ ...current, refName: value }))}
-                required
-              />
-              <TextField
-                label="Branch approvals"
-                value={branchForm.approvals}
-                onChange={(value) => setBranchForm((current) => ({ ...current, approvals: value }))}
-                type="number"
-                min={1}
-                required
-              />
-              <CheckboxField
-                label="Require file review"
-                checked={branchForm.requireFiles}
-                onChange={(checked) =>
-                  setBranchForm((current) => ({ ...current, requireFiles: checked }))
-                }
-              />
-              <ActionButton loading={createBranchRule.isPending}>Protect branch</ActionButton>
-              <MutationState
-                status={branchStatus}
-                error={createBranchRule.error}
-                loading={createBranchRule.isPending}
-              />
-            </form>
+            {loadingSettings ? (
+              <LoadingRows label="Loading branch protection" rows={2} />
+            ) : settingsLoadFailed ? (
+              <UnavailableMessage>Settings could not be loaded.</UnavailableMessage>
+            ) : !refRulesAvailable ? (
+              <UnavailableMessage>
+                Branch protection is not available here.
+              </UnavailableMessage>
+            ) : (
+              <form className="space-y-3" onSubmit={(event) => submit(event, createBranchRule.mutate)}>
+                <TextField
+                  label="Branch name"
+                  value={branchForm.refName}
+                  onChange={(value) => setBranchForm((current) => ({ ...current, refName: value }))}
+                  required
+                />
+                <TextField
+                  label="Branch approvals"
+                  value={branchForm.approvals}
+                  onChange={(value) =>
+                    setBranchForm((current) => ({ ...current, approvals: value }))
+                  }
+                  type="number"
+                  min={1}
+                  required
+                />
+                <CheckboxField
+                  label="Require file review"
+                  checked={branchForm.requireFiles}
+                  onChange={(checked) =>
+                    setBranchForm((current) => ({ ...current, requireFiles: checked }))
+                  }
+                />
+                <ActionButton loading={createBranchRule.isPending}>Protect branch</ActionButton>
+                <MutationState
+                  status={branchStatus}
+                  error={createBranchRule.error}
+                  loading={createBranchRule.isPending}
+                />
+              </form>
+            )}
           </Panel>
 
           <Panel title="Protect path">
-            <form className="space-y-3" onSubmit={(event) => submit(event, createPathRule.mutate)}>
-              <TextField
-                label="Path prefix"
-                value={pathForm.pathPrefix}
-                onChange={(value) => setPathForm((current) => ({ ...current, pathPrefix: value }))}
-                placeholder="/legal"
-                required
-              />
-              <TextField
-                label="Path branch"
-                value={pathForm.targetRef}
-                onChange={(value) => setPathForm((current) => ({ ...current, targetRef: value }))}
-                placeholder="main"
-              />
-              <TextField
-                label="Path approvals"
-                value={pathForm.approvals}
-                onChange={(value) => setPathForm((current) => ({ ...current, approvals: value }))}
-                type="number"
-                min={1}
-                required
-              />
-              <CheckboxField
-                label="Require file review"
-                checked={pathForm.requireFiles}
-                onChange={(checked) => setPathForm((current) => ({ ...current, requireFiles: checked }))}
-              />
-              <ActionButton loading={createPathRule.isPending}>Protect path</ActionButton>
-              <MutationState
-                status={pathStatus}
-                error={createPathRule.error}
-                loading={createPathRule.isPending}
-              />
-            </form>
+            {loadingSettings ? (
+              <LoadingRows label="Loading path protection" rows={2} />
+            ) : settingsLoadFailed ? (
+              <UnavailableMessage>Settings could not be loaded.</UnavailableMessage>
+            ) : !pathRulesAvailable ? (
+              <UnavailableMessage>Path protection is not available here.</UnavailableMessage>
+            ) : (
+              <form className="space-y-3" onSubmit={(event) => submit(event, createPathRule.mutate)}>
+                <TextField
+                  label="Path prefix"
+                  value={pathForm.pathPrefix}
+                  onChange={(value) =>
+                    setPathForm((current) => ({ ...current, pathPrefix: value }))
+                  }
+                  placeholder="/legal"
+                  required
+                />
+                <TextField
+                  label="Path branch"
+                  value={pathForm.targetRef}
+                  onChange={(value) => setPathForm((current) => ({ ...current, targetRef: value }))}
+                  placeholder="main"
+                />
+                <TextField
+                  label="Path approvals"
+                  value={pathForm.approvals}
+                  onChange={(value) => setPathForm((current) => ({ ...current, approvals: value }))}
+                  type="number"
+                  min={1}
+                  required
+                />
+                <CheckboxField
+                  label="Require file review"
+                  checked={pathForm.requireFiles}
+                  onChange={(checked) =>
+                    setPathForm((current) => ({ ...current, requireFiles: checked }))
+                  }
+                />
+                <ActionButton loading={createPathRule.isPending}>Protect path</ActionButton>
+                <MutationState
+                  status={pathStatus}
+                  error={createPathRule.error}
+                  loading={createPathRule.isPending}
+                />
+              </form>
+            )}
           </Panel>
         </aside>
       </div>
@@ -422,15 +534,25 @@ function WorkspaceList({ workspaces }: { readonly workspaces: readonly Workspace
   );
 }
 
+function UnavailableMessage({ children }: { readonly children: ReactNode }) {
+  return (
+    <p className="rounded-[4px] border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] text-stone-500">
+      {children}
+    </p>
+  );
+}
+
 function RuleList({
   title,
   empty,
   loading,
+  unavailable,
   rules,
 }: {
   readonly title: string;
   readonly empty: string;
   readonly loading: boolean;
+  readonly unavailable?: string | undefined;
   readonly rules: readonly {
     readonly id: string;
     readonly name: string;
@@ -445,6 +567,8 @@ function RuleList({
       </div>
       {loading ? (
         <LoadingRows label={`Loading ${title.toLowerCase()}`} rows={2} />
+      ) : unavailable ? (
+        <UnavailableMessage>{unavailable}</UnavailableMessage>
       ) : rules.length === 0 ? (
         <p className="rounded-[4px] border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] text-stone-500">
           {empty}

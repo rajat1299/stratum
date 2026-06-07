@@ -3,6 +3,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, memoryAuthStorage } from "../lib/auth.tsx";
+import {
+  loadDurableCloudFixture,
+  loadLocalFixture,
+  type SafeCapabilities,
+} from "../lib/capabilities.ts";
 import { SettingsPlaceholder } from "./SettingsPlaceholder.tsx";
 
 interface RecordedPost {
@@ -11,10 +16,18 @@ interface RecordedPost {
 }
 
 const recordedPosts: RecordedPost[] = [];
+const recordedRequests: string[] = [];
 
 function okJson(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function httpError(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
     headers: { "content-type": "application/json" },
   });
 }
@@ -37,10 +50,15 @@ function renderSettings(fetchImpl: typeof fetch) {
   return render(<SettingsPlaceholder />, { wrapper: Wrapper });
 }
 
-function settingsFetch(): typeof fetch {
+function settingsFetch(capabilities: SafeCapabilities = loadLocalFixture()): typeof fetch {
   return vi.fn<typeof fetch>(async (input, init) => {
     const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
     const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    recordedRequests.push(`${method} ${url}`);
+
+    if (url.endsWith("/v1/capabilities")) {
+      return okJson(capabilities);
+    }
 
     if (method === "POST") {
       recordedPosts.push({
@@ -147,6 +165,7 @@ let originalFetch: typeof fetch | undefined;
 beforeEach(() => {
   originalFetch = globalThis.fetch;
   recordedPosts.length = 0;
+  recordedRequests.length = 0;
 });
 afterEach(() => {
   if (originalFetch) globalThis.fetch = originalFetch;
@@ -249,5 +268,79 @@ describe("SettingsPlaceholder", () => {
         require_all_files_viewed: false,
       },
     });
+  });
+
+  it("explains hosted-preview workspace limits without calling unavailable workspace routes", async () => {
+    renderSettings(settingsFetch(loadDurableCloudFixture()));
+
+    expect(
+      await screen.findAllByText(/workspace setup is not available in this hosted preview/i),
+    ).not.toHaveLength(0);
+    expect(
+      screen.getByText(/access token issuance is not available in this hosted preview/i),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Create workspace" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Issue token" })).toBeNull();
+
+    await waitFor(() => expect(recordedRequests).toContain("GET /v1/capabilities"));
+    expect(recordedRequests.some((request) => request.includes("/workspaces"))).toBe(false);
+  });
+
+  it("explains unsupported protection groups without calling their endpoints", async () => {
+    const capabilities: SafeCapabilities = {
+      ...loadLocalFixture(),
+      protection: {
+        ref_rules: {
+          ...loadLocalFixture().protection.ref_rules,
+          available: false,
+        },
+        path_rules: {
+          ...loadLocalFixture().protection.path_rules,
+          available: false,
+        },
+      },
+    };
+
+    renderSettings(settingsFetch(capabilities));
+
+    expect(
+      await screen.findAllByText(/branch protection is not available here/i),
+    ).not.toHaveLength(0);
+    expect(
+      screen.getAllByText(/path protection is not available here/i),
+    ).not.toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Protect branch" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Protect path" })).toBeNull();
+
+    await waitFor(() => expect(recordedRequests).toContain("GET /v1/capabilities"));
+    expect(recordedRequests.some((request) => request.includes("/protected/refs"))).toBe(false);
+    expect(recordedRequests.some((request) => request.includes("/protected/paths"))).toBe(false);
+  });
+
+  it("keeps server-setting failures separate from hosted-preview limits", async () => {
+    const originalDev = import.meta.env.DEV;
+    (import.meta.env as { DEV: boolean }).DEV = false;
+    const fetchSpy = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      recordedRequests.push(`${method} ${url}`);
+      if (url.endsWith("/v1/capabilities")) {
+        return httpError(503, { error: "settings unavailable" });
+      }
+      return httpError(404, { error: "unexpected route" });
+    });
+
+    try {
+      renderSettings(fetchSpy);
+
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toMatch(/\/v1\/capabilities 503/i);
+      expect(await screen.findAllByText(/settings could not be loaded/i)).not.toHaveLength(0);
+      expect(screen.queryByText(/hosted preview/i)).toBeNull();
+      expect(recordedRequests.some((request) => request.includes("/workspaces"))).toBe(false);
+      expect(recordedRequests.some((request) => request.includes("/protected"))).toBe(false);
+    } finally {
+      (import.meta.env as { DEV: boolean }).DEV = originalDev;
+    }
   });
 });

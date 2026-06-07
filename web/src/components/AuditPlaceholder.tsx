@@ -1,6 +1,7 @@
 import type { AuditEvent, AuditOutcome } from "@stratum/sdk";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
+import { useCapabilities } from "../lib/capabilities.ts";
 import { useStratumClient } from "../lib/stratum-client.ts";
 
 const auditKeys = {
@@ -10,14 +11,21 @@ const auditKeys = {
 export function AuditPlaceholder() {
   const client = useStratumClient();
   const [limit, setLimit] = useState(50);
+  const capabilities = useCapabilities();
+  const auditSupportKnown = capabilities.data !== undefined;
+  const auditAvailable = capabilities.data?.routes.audit.available === true;
+  const auditUnavailable = auditSupportKnown && !auditAvailable;
+  const auditLoadFailed = !capabilities.isLoading && !auditSupportKnown;
   const audit = useQuery({
     queryKey: auditKeys.list(limit),
     queryFn: () => client.audit.list({ limit }),
+    enabled: auditAvailable,
     staleTime: 10_000,
   });
 
-  const events = audit.data?.events ?? [];
+  const events = auditAvailable ? (audit.data?.events ?? []) : [];
   const stats = useMemo(() => summarize(events), [events]);
+  const metricsAvailable = !auditUnavailable && !auditLoadFailed;
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -37,6 +45,7 @@ export function AuditPlaceholder() {
           <select
             value={limit}
             onChange={(event) => setLimit(Number(event.target.value))}
+            disabled={capabilities.isLoading || auditUnavailable || auditLoadFailed}
             className="h-9 rounded-[4px] border border-stone-200 bg-white px-2.5 font-mono text-[12px] text-stone-950 outline-none transition focus:border-stone-950"
           >
             {[25, 50, 100, 250].map((value) => (
@@ -48,7 +57,16 @@ export function AuditPlaceholder() {
         </label>
       </header>
 
-      {audit.error && (
+      {capabilities.error && (
+        <p
+          role="alert"
+          className="mb-4 rounded-[4px] border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-800"
+        >
+          {capabilities.error.message}
+        </p>
+      )}
+
+      {auditAvailable && audit.error && (
         <p
           role="alert"
           className="mb-4 rounded-[4px] border border-rose-200 bg-rose-50 px-3 py-2 text-[13px] text-rose-800"
@@ -58,19 +76,31 @@ export function AuditPlaceholder() {
       )}
 
       <div className="mb-4 grid gap-3 sm:grid-cols-3">
-        <Metric label="Events" value={events.length.toString()} />
-        <Metric label="Success" value={stats.success.toString()} />
-        <Metric label="Needs review" value={stats.partial.toString()} />
+        <Metric label="Events" value={metricsAvailable ? events.length.toString() : "Unavailable"} />
+        <Metric label="Success" value={metricsAvailable ? stats.success.toString() : "Unavailable"} />
+        <Metric label="Needs review" value={metricsAvailable ? stats.partial.toString() : "Unavailable"} />
       </div>
 
       <section className="rounded-[4px] border border-stone-200 bg-white">
         <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
           <h2 className="text-[14px] font-medium text-stone-950">Recent events</h2>
           <span className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
-            {audit.isFetching ? "Refreshing" : "Live"}
+            {capabilities.isLoading || audit.isFetching
+              ? "Refreshing"
+              : auditUnavailable || auditLoadFailed
+                ? "Unavailable"
+                : "Live"}
           </span>
         </div>
-        {audit.isLoading ? (
+        {capabilities.isLoading ? (
+          <LoadingEvents />
+        ) : auditLoadFailed ? (
+          <p className="p-4 text-[13px] text-stone-500">Audit settings could not be loaded.</p>
+        ) : auditUnavailable ? (
+          <p className="p-4 text-[13px] text-stone-500">
+            Audit events are not available in this hosted preview.
+          </p>
+        ) : audit.isLoading ? (
           <LoadingEvents />
         ) : events.length === 0 ? (
           <p className="p-4 text-[13px] text-stone-500">No events yet.</p>
