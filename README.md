@@ -90,6 +90,7 @@ Detailed guides are available in the [`docs/`](docs/) folder:
 | [Agent Workspace Positioning](docs/agent-workspace-positioning.md) | Messaging, category, narrative, and competitive framing |
 | [Agent Workspace Demo](docs/agent-workspace-demo.md) | Runnable 7-minute demo using CLI tools and the HTTP API |
 | [Demo Readiness](docs/demo-readiness.md) | Which gaps matter before the first polished demo |
+| [Private Beta Contract](docs/private-beta-contract.md) | Supported local and hosted durable surfaces for the private beta |
 | [CLI Cloud Bridge](docs/cli-cloud-bridge.md) | `stratumctl` CLI vision, hosted gateway, and cloud execution targets |
 | [Semantic Index](docs/semantic-index.md) | Vector-based retrieval as a derived index over text files |
 | [Execution Roadmap](docs/execution-roadmap.md) | How to evolve from workspace layer to execution layer |
