@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { fileURLToPath } from "node:url";
 
 // TanStackRouterVite() is intentionally not registered yet. Phase A2 ships
 // with code-based routing (web/src/router.tsx) so there is no src/routes/
@@ -9,6 +10,11 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@stratum/sdk": fileURLToPath(new URL("../sdk/typescript/src/index.ts", import.meta.url)),
+    },
+  },
   build: {
     rollupOptions: {
       output: {

@@ -19,6 +19,7 @@ const packageJson = JSON.parse(
 const sdkPackageJson = JSON.parse(
   readFileSync(fileURLToPath(new URL("../../typescript/package.json", import.meta.url)), "utf8"),
 ) as PackageJson;
+const rootExportSource = readFileSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf8");
 
 describe("agents package boundary", () => {
   it("publishes root and adapter subpath exports from dist only", () => {
@@ -55,5 +56,12 @@ describe("agents package boundary", () => {
       "@mastra/core": "1.38.0",
       zod: "4.4.3",
     });
+  });
+
+  it("keeps the root export free of optional framework peer imports", () => {
+    for (const name of ["@openai/agents", "ai", "deepagents", "@mastra/core", "zod"]) {
+      expect(rootExportSource).not.toContain(`"${name}"`);
+      expect(rootExportSource).not.toContain(`'${name}'`);
+    }
   });
 });

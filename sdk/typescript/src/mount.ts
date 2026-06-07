@@ -51,7 +51,7 @@ export interface StratumVolumeOptions {
   readonly pathIndex?: PathIndex;
   readonly cache?: SessionCache;
   readonly cacheOptions?: SessionCacheOptions;
-  readonly logger?: StratumVolumeLogger;
+  readonly logger?: StratumVolumeLogger | undefined;
 }
 
 export type StratumMountOptions = StratumVolumeOptions;
@@ -73,7 +73,7 @@ export class StratumVolume {
   readonly client: StratumVolumeClient;
   readonly pathIndex: PathIndex;
   readonly cache: SessionCache;
-  private readonly logger?: StratumVolumeLogger;
+  private readonly logger: StratumVolumeLogger | undefined;
   private cwd: string;
 
   constructor(client: StratumVolumeClient, options: StratumVolumeOptions = {}) {

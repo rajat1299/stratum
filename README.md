@@ -294,6 +294,17 @@ cargo test --release --test perf_comparison -- --nocapture
 
 ## Testing
 
+Run the local close-out verifier for Rust, SDK packages, agent adapters, and
+the web console:
+
+```bash
+./scripts/check-local-verification.sh
+```
+
+The script keeps Cargo build output outside the repository by default and
+checks that the web console can use the SDK source without generated SDK
+`dist/` files.
+
 215 tests across 5 suites:
 
 ```bash

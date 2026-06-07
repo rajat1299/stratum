@@ -10,8 +10,14 @@
  */
 
 import { defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      "@stratum/sdk": fileURLToPath(new URL("../sdk/typescript/src/index.ts", import.meta.url)),
+    },
+  },
   esbuild: {
     jsx: "automatic",
     jsxImportSource: "react",

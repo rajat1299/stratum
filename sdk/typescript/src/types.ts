@@ -1,11 +1,11 @@
 export interface StratumClientOptions {
   readonly baseUrl: string;
-  readonly fetch?: typeof fetch;
-  readonly auth?: StratumAuth;
-  readonly workspaceId?: string;
-  readonly workspaceToken?: string;
-  readonly repoId?: string;
-  readonly idempotencyKeyPrefix?: string;
+  readonly fetch?: typeof fetch | undefined;
+  readonly auth?: StratumAuth | undefined;
+  readonly workspaceId?: string | undefined;
+  readonly workspaceToken?: string | undefined;
+  readonly repoId?: string | undefined;
+  readonly idempotencyKeyPrefix?: string | undefined;
 }
 
 export type StratumAuth =
@@ -15,11 +15,11 @@ export type StratumAuth =
       readonly type: "workspace";
       readonly workspaceId: string;
       readonly workspaceToken: string;
-      readonly repoId?: string;
+      readonly repoId?: string | undefined;
     };
 
 export interface StratumMutationOptions {
-  readonly idempotencyKey?: string;
+  readonly idempotencyKey?: string | undefined;
 }
 
 export type StratumRequestBody = BodyInit | Uint8Array;
@@ -56,7 +56,7 @@ export interface StratumStat {
 }
 
 export interface StratumWriteOptions extends StratumMutationOptions {
-  readonly mimeType?: string;
+  readonly mimeType?: string | undefined;
 }
 
 export interface StratumWriteResult {

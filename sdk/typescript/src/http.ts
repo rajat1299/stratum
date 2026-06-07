@@ -5,26 +5,26 @@ export type ResponseKind = "bytes" | "json" | "text";
 
 export interface RequestOptions {
   readonly method: string;
-  readonly query?: readonly (readonly [string, string])[];
-  readonly headers?: HeadersInit;
-  readonly body?: StratumRequestBody | unknown;
+  readonly query?: readonly (readonly [string, string])[] | undefined;
+  readonly headers?: HeadersInit | undefined;
+  readonly body?: StratumRequestBody | unknown | undefined;
   readonly responseKind: ResponseKind;
-  readonly idempotencyKey?: string;
-  readonly autoIdempotency?: boolean;
-  readonly skipAuth?: boolean;
+  readonly idempotencyKey?: string | undefined;
+  readonly autoIdempotency?: boolean | undefined;
+  readonly skipAuth?: boolean | undefined;
 }
 
 export interface HttpClientOptions {
   readonly baseUrl: string;
   readonly fetchImpl: typeof fetch;
-  readonly auth?: StratumAuth;
+  readonly auth?: StratumAuth | undefined;
   readonly idempotencyKeyPrefix: string;
 }
 
 export class StratumHttpClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly auth?: StratumAuth;
+  private readonly auth: StratumAuth | undefined;
   private readonly idempotencyKeyPrefix: string;
 
   constructor(options: HttpClientOptions) {
@@ -60,11 +60,15 @@ export class StratumHttpClient {
     }
 
     const body = toRequestBody(options.body, headers);
-    const response = await this.fetchImpl(url, {
+    const requestInit: RequestInit = {
       method: options.method,
       headers,
-      body,
-    });
+    };
+    if (body !== undefined) {
+      requestInit.body = body;
+    }
+
+    const response = await this.fetchImpl(url, requestInit);
 
     if (!response.ok) {
       const errorBody = await response.text();
