@@ -12,7 +12,7 @@
       "label": "workspace"
     }
   },
-  "capability_revision": "2026-06-04-2",
+  "capability_revision": "2026-06-08-1",
   "cases": [
     {
       "auth": "none",
@@ -21,7 +21,7 @@
           "cache-control": "max-age=60, must-revalidate"
         },
         "json_paths": {
-          "$.revision": "2026-06-04-2",
+          "$.revision": "2026-06-08-1",
           "$.server.backend_mode": "local",
           "$.server.core_runtime": "local-state"
         },
@@ -46,7 +46,7 @@
           "cache-control": "max-age=60, must-revalidate"
         },
         "json_paths": {
-          "$.revision": "2026-06-04-2",
+          "$.revision": "2026-06-08-1",
           "$.server.backend_mode": "durable",
           "$.server.core_runtime": "durable-cloud"
         },
@@ -268,11 +268,11 @@
       "auth": "none",
       "expect": {
         "json_paths": {
-          "$.error": "stratum: operation not supported: durable-cloud route is not supported yet"
+          "$.error": "stratum: missing authorization header"
         },
-        "status": 501
+        "status": 401
       },
-      "id": "unsupported.durable.workspaces",
+      "id": "auth.durable.workspaces.missing",
       "method": "GET",
       "mode": "durable-cloud",
       "path": "/workspaces",
@@ -362,6 +362,6 @@
     "local-state",
     "durable-cloud"
   ],
-  "revision": "2026-06-04-1",
+  "revision": "2026-06-08-1",
   "version": 1
 }

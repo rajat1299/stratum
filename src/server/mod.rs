@@ -1055,6 +1055,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         .merge(routes_fs::durable_read_routes())
         .merge(routes_review::routes())
         .merge(routes_vcs::durable_read_routes())
+        .merge(routes_workspace::routes())
         .merge(durable_unsupported_routes())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
@@ -1077,11 +1078,6 @@ fn durable_unsupported_routes() -> Router<AppState> {
         .route("/execute/{*path}", any(durable_cloud_route_not_supported))
         .route("/audit", any(durable_cloud_route_not_supported))
         .route("/audit/{*path}", any(durable_cloud_route_not_supported))
-        .route("/workspaces", any(durable_cloud_route_not_supported))
-        .route(
-            "/workspaces/{*path}",
-            any(durable_cloud_route_not_supported),
-        )
 }
 
 async fn durable_cloud_route_not_supported() -> impl axum::response::IntoResponse {
@@ -3347,7 +3343,6 @@ mod tests {
             (reqwest::Method::POST, "/auth/login"),
             (reqwest::Method::POST, "/runs"),
             (reqwest::Method::GET, "/audit"),
-            (reqwest::Method::GET, "/workspaces"),
             (reqwest::Method::GET, "/vcs/recovery"),
             (reqwest::Method::POST, "/vcs/recovery/run"),
         ];
@@ -3372,6 +3367,15 @@ mod tests {
                 "{path}"
             );
         }
+        let workspace_response = client
+            .get(format!("{base_url}/workspaces"))
+            .send()
+            .await
+            .expect("workspace request should complete");
+        assert_eq!(
+            workspace_response.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
         server.abort();
     }
 

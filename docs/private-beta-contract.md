@@ -1,6 +1,6 @@
 # Private Beta Contract
 
-Status: 2026-06-08. Capability manifest revision: `2026-06-04-2`.
+Status: 2026-06-08. Capability manifest revision: `2026-06-08-1`.
 
 This contract freezes what Stratum supports for private beta. It is grounded in
 `sdk/contracts/capabilities.v1.json`,
@@ -15,9 +15,10 @@ API, and the local review/change-request routes for the beta review loop:
 workspace setup, scoped token, agent edit, change request, diff review,
 approval or rejection, merge, audit trail, and revert.
 
-Hosted durable is a narrower preview. It supports a pre-provisioned workspace
-and a session-ref route surface for selected HTTP and `stratumctl`-style
-operations. It is not a hosted admin product yet.
+Hosted durable is a narrower preview. It supports workspace setup and token
+management through a repo-bound operator admin path, plus a session-ref route
+surface for selected HTTP and `stratumctl`-style operations. It is not a hosted
+admin product yet.
 
 ## Support Matrix
 
@@ -25,10 +26,10 @@ operations. It is not a hosted admin product yet.
 |---|---|---|
 | Runtime | `local-state` | `durable-cloud` |
 | Complete beta path | Yes. This is the supported end-to-end demo path. | No. Preview route surface only. |
-| Workspace source | Local Stratum state exposed as `/` through the HTTP workspace API. | Durable core state exposed as `/` for a pre-provisioned workspace. |
-| Required setup | Create local users, agents, directories, and demo content. | Operator pre-provisions the workspace, repo context, and session-ref. |
+| Workspace source | Local Stratum state exposed as `/` through the HTTP workspace API. | Durable core state exposed as `/` for a repo-bound hosted workspace. |
+| Required setup | Create local users, agents, directories, and demo content. | Operator creates the repo context, admin workspace token, workspace, target agent identity, and session-ref. |
 | Client path | CLI setup plus HTTP API, with `stratumctl` as a thin client where available. | HTTP API or `stratumctl`-style calls with explicit workspace, repo, and session context. |
-| Workspace lifecycle | Workspace list/create and token issue/revoke routes are present in local-state. | Workspaces and tokens are set up by an operator ahead of time. The hosted HTTP workspace lifecycle routes stay unavailable until the durable admin path lands. |
+| Workspace lifecycle | Workspace list/create and token issue/revoke routes are present in local-state. | Workspace list/create/get and token issue/revoke routes are available through the repo-bound durable admin path. |
 | Audit listing | Supported for user-admin sessions only. Bearer tokens are rejected. | Audit listing is unsupported right now. |
 | Execution | Not part of the beta contract. Default capabilities report `/execute` unavailable. | Unsupported. |
 | Semantic search | Unsupported in the beta contract. Local capabilities report it unavailable. | Unsupported in the checked-in durable manifest because the search index is unavailable. |
@@ -43,7 +44,7 @@ operations. It is not a hosted admin product yet.
 | Agent bearer tokens | Supported for local agent access. | Not the hosted durable contract by itself. Hosted durable uses workspace-scoped access. |
 | Workspace bearer access | Supported for workspace-scoped filesystem, search, and tree routes. | Required with explicit workspace and repo context. |
 | OIDC/SAML | Not ready for private beta. OIDC is advertised as unavailable; SAML is not part of the capability manifest. | Not ready for private beta. |
-| Hosted admin UI | Not applicable. | Not ready. Operators manage pre-provisioning outside this contract. |
+| Hosted admin UI | Not applicable. | Not ready. Operators use the durable admin HTTP path or setup scripts. |
 
 ## Route Support
 
@@ -59,8 +60,8 @@ operations. It is not a hosted admin product yet.
 | VCS recovery | Unsupported. | Unsupported. |
 | Review and change-request routes | Supported, admin-gated, and idempotent where advertised. | Supported with explicit repo context and an admin-capable workspace session. |
 | Protected refs/paths | Supported. | Supported. |
-| Workspaces list/create | Supported in local-state. | Set up by an operator ahead of time; hosted HTTP routes stay unavailable until the durable admin path lands. |
-| Workspace token issue/revoke | Supported in local-state. Token issue is not idempotent unless secret replay KMS is configured; token revoke is not idempotent. | Set up by an operator ahead of time; hosted HTTP routes stay unavailable until the durable admin path lands. |
+| Workspaces list/create/get | Supported in local-state. | Supported through a repo-bound admin workspace bearer. |
+| Workspace token issue/revoke | Supported in local-state. Token issue is not idempotent unless secret replay KMS is configured; token revoke is not idempotent. | Supported through a repo-bound admin workspace bearer. Token issue names the hosted agent by Agent ID. |
 | Audit listing | Supported for user-admin sessions. | Unsupported right now. |
 | Runs | Record-only route is supported locally; it does not schedule execution. | Unsupported right now. |
 | Execute | Unavailable by default and outside the beta contract. | Unsupported right now. |
@@ -69,7 +70,6 @@ operations. It is not a hosted admin product yet.
 
 The private beta does not promise:
 
-- durable-cloud HTTP workspace list/create/token issue/revoke routes
 - durable-cloud audit listing
 - hosted durable `/runs` or `/execute`
 - OIDC or SAML login readiness
@@ -99,12 +99,12 @@ single short demo script is still a close-out task.
 
 Hosted durable close-out remains narrower:
 
-- pre-provision the workspace before the customer flow starts
-- set up workspace tokens through an operator-owned durable admin path
+- create the hosted workspace before the customer flow starts
+- issue workspace tokens through an operator-owned durable admin path
 - pass explicit workspace and repo context on every hosted durable request
 - use a session-ref for mounted durable mutations
-- keep workspace lifecycle, token lifecycle, audit listing, runs, execute,
-  semantic search, MCP, FUSE, and hosted admin screens out of the promised demo
+- keep audit listing, runs, execute, semantic search, MCP, FUSE, and hosted
+  admin screens out of the promised demo
 
 The implementation plan for durable workspace and token parity is tracked in
 `docs/plans/2026-06-08-durable-workspace-token-parity.md`.

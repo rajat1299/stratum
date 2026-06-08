@@ -1,5 +1,5 @@
 {
-  "revision": "2026-06-04-2",
+  "revision": "2026-06-08-1",
   "server": {
     "name": "stratum",
     "version": "1.0.0",
@@ -250,27 +250,46 @@
     },
     "workspaces": {
       "list": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "reason": "durable-cloud route is not supported yet"
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "create": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "issue_token": {
-        "available": false,
+        "available": true,
         "admin": true,
         "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "reason": "secret replay KMS is not configured",
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal",
+          "durable-principal-uid"
+        ]
       },
       "revoke_token": {
-        "available": false,
+        "available": true,
         "admin": true,
         "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ],
+        "notes": "Idempotency-Key is not supported for workspace-token revocation."
       }
     },
     "audit": {
@@ -388,7 +407,8 @@
       "POST /change-requests/{id}/comments",
       "POST /change-requests/{id}/reject",
       "POST /change-requests/{id}/merge",
-      "POST /change-requests/{id}/approvals/{approval_id}/dismiss"
+      "POST /change-requests/{id}/approvals/{approval_id}/dismiss",
+      "POST /workspaces"
     ]
   },
   "recovery": {

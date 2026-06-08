@@ -435,18 +435,31 @@ export interface WorkspaceRecord {
   readonly version: number;
   readonly base_ref?: string;
   readonly session_ref?: string | null;
+  readonly org_id?: string | null;
+  readonly repo_id?: string | null;
 }
 
 export interface WorkspaceListResponse {
   readonly workspaces: readonly WorkspaceRecord[];
 }
 
-export interface IssueWorkspaceTokenOptions extends StratumMutationOptions {
+interface IssueWorkspaceTokenBaseOptions extends StratumMutationOptions {
   readonly name: string;
-  readonly agent_token: string;
   readonly read_prefixes?: readonly string[];
   readonly write_prefixes?: readonly string[];
 }
+
+export type IssueWorkspaceTokenOptions = IssueWorkspaceTokenBaseOptions &
+  (
+    | {
+        readonly agent_token: string;
+        readonly principal_uid?: never;
+      }
+    | {
+        readonly agent_token?: never;
+        readonly principal_uid: number;
+      }
+  );
 
 export interface IssueWorkspaceTokenResponse {
   readonly workspace_id: string;
@@ -454,6 +467,7 @@ export interface IssueWorkspaceTokenResponse {
   readonly name: string;
   readonly workspace_token: string;
   readonly agent_uid: number;
+  readonly principal_uid: number | null;
   readonly read_prefixes: readonly string[];
   readonly write_prefixes: readonly string[];
   readonly base_ref: string;

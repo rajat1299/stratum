@@ -400,6 +400,8 @@ class WorkspaceRecord(TypedDict):
     version: int
     base_ref: NotRequired[str]
     session_ref: NotRequired[str | None]
+    org_id: NotRequired[str | None]
+    repo_id: NotRequired[str | None]
 
 
 class WorkspaceListResponse(TypedDict):
@@ -408,7 +410,8 @@ class WorkspaceListResponse(TypedDict):
 
 class IssueWorkspaceTokenOptions(TypedDict):
     name: str
-    agent_token: str
+    agent_token: NotRequired[str]
+    principal_uid: NotRequired[int]
     read_prefixes: NotRequired[list[str]]
     write_prefixes: NotRequired[list[str]]
 
@@ -419,6 +422,7 @@ class IssueWorkspaceTokenResponse(TypedDict):
     name: str
     workspace_token: str
     agent_uid: int
+    principal_uid: int | None
     read_prefixes: list[str]
     write_prefixes: list[str]
     base_ref: str

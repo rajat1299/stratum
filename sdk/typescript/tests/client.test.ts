@@ -9,6 +9,7 @@ import {
   type ChangeRequestResponse,
   type ExecuteJobSummary,
   type IssueWorkspaceTokenOptions,
+  type WorkspaceRecord,
 } from "../src/index.js";
 
 const capabilitiesFixture = JSON.parse(
@@ -72,7 +73,7 @@ function executeSummary(overrides: Partial<ExecuteJobSummary> = {}): ExecuteJobS
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-06-04-2");
+    expect(capabilitiesFixture.revision).toBe("2026-06-08-1");
     expect(capabilitiesFixture.hints.banner).toBeNull();
     expect(capabilitiesFixture.sources.workspace.backing_store).toBe("local-state");
     expect(capabilitiesFixture.sources.workspace.backing_paths_exposed).toBe(false);
@@ -145,12 +146,29 @@ describe("resource clients", () => {
     expect(durableCapabilitiesFixture.protection.ref_rules.require_all_files_viewed_default).toBe(true);
     expect(durableCapabilitiesFixture.protection.path_rules.require_all_files_viewed_default).toBe(true);
     expect(durableCapabilitiesFixture.routes.audit.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.workspaces.list.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.workspaces.create.requires).toEqual([
+      "workspace-bearer",
+      "durable-admin-principal",
+      "repo-bound-principal",
+    ]);
+    expect(durableCapabilitiesFixture.routes.workspaces.issue_token.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.workspaces.issue_token.requires).toEqual([
+      "workspace-bearer",
+      "durable-admin-principal",
+      "repo-bound-principal",
+      "durable-principal-uid",
+    ]);
     expect(durableCapabilitiesFixture.routes.workspaces.issue_token.reason).toBe(
-      "durable-cloud route is not supported yet",
+      "secret replay KMS is not configured",
     );
-    expect(durableCapabilitiesFixture.routes.workspaces.revoke_token.reason).toBe(
-      "durable-cloud route is not supported yet",
-    );
+    expect(durableCapabilitiesFixture.routes.workspaces.revoke_token.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.workspaces.revoke_token.reason).toBeUndefined();
+    expect(durableCapabilitiesFixture.routes.workspaces.revoke_token.requires).toEqual([
+      "workspace-bearer",
+      "durable-admin-principal",
+      "repo-bound-principal",
+    ]);
     expect(durableCapabilitiesFixture.recovery.scheduler_present).toBe(true);
     expect(durableCapabilitiesFixture.routes.execute.available).toBe(false);
     expect(durableCapabilitiesFixture.routes.execute.reason).toBe("durable-cloud route is not supported yet");
@@ -545,6 +563,30 @@ describe("resource clients", () => {
     };
 
     expect(valid).toEqual({ name: "ci", agent_token: "token", idempotencyKey: "secret-replay" });
+    const durable: IssueWorkspaceTokenOptions = {
+      name: "hosted-ci",
+      principal_uid: 501,
+      idempotencyKey: "secret-replay",
+    };
+
+    expect(durable).toEqual({ name: "hosted-ci", principal_uid: 501, idempotencyKey: "secret-replay" });
+  });
+
+  it("types durable workspace org and repo identifiers", () => {
+    const workspace: WorkspaceRecord = {
+      id: "ws_1",
+      name: "Acme review",
+      root_path: "/contracts",
+      head_commit: null,
+      version: 1,
+      base_ref: "main",
+      session_ref: "agent/acme",
+      org_id: "org_acme",
+      repo_id: "repo_acme",
+    };
+
+    expect(workspace.org_id).toBe("org_acme");
+    expect(workspace.repo_id).toBe("repo_acme");
   });
 });
 

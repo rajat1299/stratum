@@ -7206,12 +7206,15 @@ fn row_to_workspace_principal_record(row: Row) -> Result<WorkspacePrincipalRecor
     })
 }
 
-async fn load_active_workspace_principal(
-    client: &Client,
+async fn load_active_workspace_principal<C>(
+    client: &C,
     org_id: &str,
     repo_id: &str,
     principal_uid: crate::auth::Uid,
-) -> Result<Option<WorkspacePrincipalRecord>, VfsError> {
+) -> Result<Option<WorkspacePrincipalRecord>, VfsError>
+where
+    C: GenericClient + Sync,
+{
     let principal_uid = uid_to_i32(principal_uid)?;
     let row = client
         .query_opt(
@@ -7450,6 +7453,17 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         row.map(row_to_workspace_record).transpose()
     }
 
+    async fn get_workspace_principal_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        principal_uid: Uid,
+    ) -> Result<Option<WorkspacePrincipalRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        load_active_workspace_principal(&client, org_id.as_str(), repo_id.as_str(), principal_uid)
+            .await
+    }
+
     async fn update_head_commit(
         &self,
         id: Uuid,
@@ -7643,23 +7657,93 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         read_prefixes: Vec<String>,
         write_prefixes: Vec<String>,
     ) -> Result<IssuedWorkspaceToken, VfsError> {
-        if self
-            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
-            .await?
-            .is_none()
-        {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("workspace token transaction", error))?;
+
+        let workspace_row = tx
+            .query_opt(
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE id = $1 AND org_id = $2 AND repo_id = $3
+                   FOR UPDATE"#,
+                &[&workspace_id, &org_id.as_str(), &repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace token load org repo workspace", error))?;
+        let Some(workspace_row) = workspace_row else {
             return Err(VfsError::NotFound {
                 path: format!("workspace:{workspace_id}"),
             });
+        };
+        let workspace = row_to_workspace_record(workspace_row)?;
+        if load_active_workspace_principal(&tx, org_id.as_str(), repo_id.as_str(), agent_uid)
+            .await?
+            .is_none()
+        {
+            return Err(VfsError::PermissionDenied {
+                path: format!("workspace-principal:{agent_uid}"),
+            });
         }
-        self.issue_scoped_workspace_token(
-            workspace_id,
-            name,
-            agent_uid,
-            read_prefixes,
-            write_prefixes,
-        )
-        .await
+
+        let read_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, read_prefixes)?;
+        let write_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
+        let read_json = Json(&read_prefixes);
+        let write_json = Json(&write_prefixes);
+        let agent_uid = uid_to_i32(agent_uid)?;
+
+        for _ in 0..3 {
+            let raw_secret = generate_workspace_token_secret();
+            let secret_hash = hash_workspace_token_secret(&raw_secret);
+            let token_id = Uuid::new_v4();
+            let row = tx
+                .query_opt(
+                    r#"INSERT INTO workspace_tokens (
+                           id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
+                           read_prefixes_json, write_prefixes_json,
+                           principal_uid, token_version, issued_at, updated_at,
+                           expires_at, revoked_at
+                       )
+                       VALUES (
+                           $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                           $6, 1, now(), now(), NULL, NULL
+                       )
+                       ON CONFLICT (workspace_id, secret_hash) DO NOTHING
+                       RETURNING id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
+                                 read_prefixes_json, write_prefixes_json,
+                                 principal_uid, token_version, issued_at, updated_at,
+                                 expires_at, revoked_at, created_at"#,
+                    &[
+                        &token_id,
+                        &workspace_id,
+                        &workspace.org_id,
+                        &workspace.repo_id,
+                        &name,
+                        &agent_uid,
+                        &secret_hash,
+                        &read_json,
+                        &write_json,
+                    ],
+                )
+                .await
+                .map_err(|error| postgres_error("workspace token insert", error))?;
+
+            if let Some(row) = row {
+                let token = row_to_workspace_token_record(row)?;
+                tx.commit()
+                    .await
+                    .map_err(|error| postgres_error("workspace token commit", error))?;
+                return Ok(IssuedWorkspaceToken { token, raw_secret });
+            }
+        }
+
+        Err(VfsError::ObjectWriteConflict {
+            message: "workspace token secret collision after retries".to_string(),
+        })
     }
 
     async fn validate_workspace_token_at(

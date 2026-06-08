@@ -13,7 +13,7 @@ use crate::backend::search_index::{
 use crate::backend::{RepoId, StratumStores};
 use crate::vcs::{MAIN_REF, RefName};
 
-pub const CAPABILITIES_REVISION: &str = "2026-06-04-2";
+pub const CAPABILITIES_REVISION: &str = "2026-06-08-1";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -422,7 +422,7 @@ fn route_capabilities(
         search: search_routes(),
         vcs: vcs_routes(durable_cloud, recovery_available),
         review: review_routes(true, durable_cloud),
-        workspaces: workspace_routes(!durable_cloud, secret_replay_kms_available),
+        workspaces: workspace_routes(durable_cloud, secret_replay_kms_available),
         audit: audit_route(!durable_cloud),
         runs: runs_route(!durable_cloud),
         execute: execute_route(durable_cloud, execution_runner),
@@ -647,49 +647,62 @@ fn review_routes(available: bool, durable_cloud: bool) -> ReviewRouteCapabilitie
 }
 
 fn workspace_routes(
-    available: bool,
+    durable_cloud: bool,
     secret_replay_kms_available: bool,
 ) -> WorkspaceRouteCapabilities {
-    let unsupported_reason = || UNSUPPORTED_DURABLE_CLOUD_REASON.to_string();
-    let issue_token_idempotent = available && secret_replay_kms_available;
+    let mut list = admin_route(true);
+    let mut create = mutation(true, true);
+    let mut revoke_requires = Vec::new();
+    if durable_cloud {
+        list.requires = durable_admin_requirements(false);
+        create.requires = durable_admin_requirements(false);
+        revoke_requires = durable_admin_requirements(false);
+    }
+
+    let issue_token_idempotent = secret_replay_kms_available;
+    let mut issue_requires = if durable_cloud {
+        let mut requirements = durable_admin_requirements(false);
+        requirements.push("durable-principal-uid".to_string());
+        requirements
+    } else {
+        Vec::new()
+    };
+    if issue_token_idempotent {
+        issue_requires.push("secret-replay-kms".to_string());
+    }
+
     WorkspaceRouteCapabilities {
-        list: admin_route(available),
-        create: mutation(available, true),
+        list,
+        create,
         issue_token: RouteOperationCapability {
-            available,
+            available: true,
             admin: true,
             idempotent: Some(issue_token_idempotent),
-            reason: if !available {
-                Some(unsupported_reason())
-            } else if !secret_replay_kms_available {
+            reason: if !secret_replay_kms_available {
                 Some("secret replay KMS is not configured".to_string())
             } else {
                 None
             },
             tracking_ref: None,
             blocked_when: Vec::new(),
-            requires: if issue_token_idempotent {
-                vec!["secret-replay-kms".to_string()]
-            } else {
-                Vec::new()
-            },
+            requires: issue_requires,
             execution: None,
             notes: issue_token_idempotent.then(|| {
                 "Idempotency-Key replay stores only encrypted secret replay envelopes.".to_string()
             }),
         },
         revoke_token: RouteOperationCapability {
-            available,
+            available: true,
             admin: true,
             idempotent: Some(false),
-            reason: (!available).then(unsupported_reason),
+            reason: None,
             tracking_ref: None,
             blocked_when: Vec::new(),
-            requires: Vec::new(),
+            requires: revoke_requires,
             execution: None,
-            notes: available.then(|| {
-                "Idempotency-Key is not supported for workspace-token revocation.".to_string()
-            }),
+            notes: Some(
+                "Idempotency-Key is not supported for workspace-token revocation.".to_string(),
+            ),
         },
     }
 }
@@ -902,6 +915,7 @@ fn idempotency_capabilities(
             "POST /change-requests/{id}/reject",
             "POST /change-requests/{id}/merge",
             "POST /change-requests/{id}/approvals/{approval_id}/dismiss",
+            "POST /workspaces",
         ]
         .into_iter()
         .map(String::from)
@@ -932,7 +946,7 @@ fn idempotency_capabilities(
         .map(String::from)
         .collect()
     };
-    if !durable_cloud && secret_replay_kms_available {
+    if secret_replay_kms_available {
         endpoints_supported.push("POST /workspaces/{id}/tokens".to_string());
     }
 
@@ -1004,7 +1018,7 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-06-04-2");
+        assert_eq!(body.revision, CAPABILITIES_REVISION);
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
         assert_eq!(body.sources.workspace.backing_store, "local-state");
@@ -1158,6 +1172,7 @@ mod tests {
                 "POST /change-requests/{id}/reject".to_string(),
                 "POST /change-requests/{id}/merge".to_string(),
                 "POST /change-requests/{id}/approvals/{approval_id}/dismiss".to_string(),
+                "POST /workspaces".to_string(),
             ]
         );
         assert!(body.routes.vcs.log.available);
@@ -1196,16 +1211,52 @@ mod tests {
         );
         assert!(!body.routes.vcs.recovery.available);
         assert!(!body.routes.audit.available);
-        assert!(!body.routes.workspaces.create.available);
+        assert!(body.routes.workspaces.list.available);
+        assert_eq!(
+            body.routes.workspaces.list.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+            ]
+        );
+        assert!(body.routes.workspaces.create.available);
+        assert_eq!(
+            body.routes.workspaces.create.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+            ]
+        );
+        assert!(body.routes.workspaces.issue_token.available);
+        assert_eq!(
+            body.routes.workspaces.issue_token.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+                "durable-principal-uid".to_string(),
+            ]
+        );
         assert_eq!(
             body.routes.workspaces.issue_token.reason.as_deref(),
-            Some("durable-cloud route is not supported yet")
+            Some("secret replay KMS is not configured")
         );
+        assert!(body.routes.workspaces.revoke_token.available);
         assert_eq!(
-            body.routes.workspaces.revoke_token.reason.as_deref(),
-            Some("durable-cloud route is not supported yet")
+            body.routes.workspaces.revoke_token.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+            ]
         );
-        assert_eq!(body.routes.workspaces.revoke_token.notes, None);
+        assert_eq!(body.routes.workspaces.revoke_token.reason.as_deref(), None);
+        assert_eq!(
+            body.routes.workspaces.revoke_token.notes.as_deref(),
+            Some("Idempotency-Key is not supported for workspace-token revocation.")
+        );
         assert!(!body.routes.runs.available);
         assert!(!body.routes.execute.available);
         assert_eq!(
@@ -1783,30 +1834,6 @@ mod tests {
                 body.routes.vcs.recovery.available,
                 reqwest::Method::GET,
                 "/vcs/recovery",
-            ),
-            (
-                "workspaces.list",
-                body.routes.workspaces.list.available,
-                reqwest::Method::GET,
-                "/workspaces",
-            ),
-            (
-                "workspaces.create",
-                body.routes.workspaces.create.available,
-                reqwest::Method::POST,
-                "/workspaces",
-            ),
-            (
-                "workspaces.issue_token",
-                body.routes.workspaces.issue_token.available,
-                reqwest::Method::POST,
-                "/workspaces/00000000-0000-0000-0000-000000000001/tokens",
-            ),
-            (
-                "workspaces.revoke_token",
-                body.routes.workspaces.revoke_token.available,
-                reqwest::Method::POST,
-                "/workspaces/00000000-0000-0000-0000-000000000001/tokens/00000000-0000-0000-0000-000000000002/revoke",
             ),
             (
                 "audit",

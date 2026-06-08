@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-pub const CONFORMANCE_FIXTURE_REVISION: &str = "2026-06-04-1";
+pub const CONFORMANCE_FIXTURE_REVISION: &str = "2026-06-08-1";
 pub const CONFORMANCE_FIXTURE_VERSION: u32 = 1;
 pub const CONFORMANCE_FIXTURE_FILE: &str = "conformance.routes.v1.json";
 
@@ -346,6 +346,7 @@ mod capabilities {
 mod auth {
     use super::harness::*;
     use super::*;
+    use crate::backend::{RepoId, StratumStores};
 
     #[tokio::test]
     async fn fixture_auth_cases_fail_closed() {
@@ -366,6 +367,22 @@ mod auth {
                 }
                 "auth.durable.fs-route.missing" => {
                     let router = durable_read_router().await;
+                    let (base_url, server) = spawn_test_router(router).await;
+                    let response = reqwest::Client::new()
+                        .get(format!("{base_url}{}", case.path))
+                        .send()
+                        .await
+                        .expect("request");
+                    assert_auth_case(&fixture, case, response, &[]).await;
+                    server.abort();
+                }
+                "auth.durable.workspaces.missing" => {
+                    let stores = StratumStores::local_memory();
+                    let router = durable_router(
+                        stores.workspace_metadata.clone(),
+                        RepoId::new("repo_conformance_workspace_auth").expect("repo"),
+                        stores,
+                    );
                     let (base_url, server) = spawn_test_router(router).await;
                     let response = reqwest::Client::new()
                         .get(format!("{base_url}{}", case.path))

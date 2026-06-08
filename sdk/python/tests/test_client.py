@@ -3,13 +3,13 @@ from pathlib import Path
 from typing import cast
 
 import httpx
-
 from stratum_sdk import BearerAuth, StratumClient
 from stratum_sdk.types import (
     ApprovalPolicyDecision,
     ApprovalResponse,
     CapabilityManifest,
     ChangeRequestResponse,
+    WorkspaceRecord,
 )
 
 CONTRACT_FIXTURE = Path(__file__).resolve().parents[2] / "contracts" / "capabilities.v1.json"
@@ -29,7 +29,7 @@ def load_durable_capabilities_fixture() -> CapabilityManifest:
 def test_capabilities_contract_fixture_shape() -> None:
     fixture = load_capabilities_fixture()
 
-    assert fixture["revision"] == "2026-06-04-2"
+    assert fixture["revision"] == "2026-06-08-1"
     assert fixture["hints"]["banner"] is None
     assert fixture["sources"]["workspace"]["backing_store"] == "local-state"
     assert fixture["sources"]["workspace"]["backing_paths_exposed"] is False
@@ -108,12 +108,30 @@ def test_durable_capabilities_contract_fixture_shape() -> None:
     assert fixture["protection"]["ref_rules"]["require_all_files_viewed_default"] is True
     assert fixture["protection"]["path_rules"]["require_all_files_viewed_default"] is True
     assert fixture["routes"]["audit"]["available"] is False
-    assert fixture["routes"]["workspaces"]["issue_token"]["reason"] == (
-        "durable-cloud route is not supported yet"
+    assert fixture["routes"]["workspaces"]["list"]["available"] is True
+    assert fixture["routes"]["workspaces"]["create"]["requires"] == [
+        "workspace-bearer",
+        "durable-admin-principal",
+        "repo-bound-principal",
+    ]
+    assert fixture["routes"]["workspaces"]["issue_token"]["available"] is True
+    assert fixture["routes"]["workspaces"]["issue_token"]["requires"] == [
+        "workspace-bearer",
+        "durable-admin-principal",
+        "repo-bound-principal",
+        "durable-principal-uid",
+    ]
+    assert (
+        fixture["routes"]["workspaces"]["issue_token"]["reason"]
+        == "secret replay KMS is not configured"
     )
-    assert fixture["routes"]["workspaces"]["revoke_token"]["reason"] == (
-        "durable-cloud route is not supported yet"
-    )
+    assert fixture["routes"]["workspaces"]["revoke_token"]["available"] is True
+    assert "reason" not in fixture["routes"]["workspaces"]["revoke_token"]
+    assert fixture["routes"]["workspaces"]["revoke_token"]["requires"] == [
+        "workspace-bearer",
+        "durable-admin-principal",
+        "repo-bound-principal",
+    ]
     assert fixture["routes"]["execute"]["available"] is False
     assert fixture["routes"]["execute"]["reason"] == "durable-cloud route is not supported yet"
     assert fixture["recovery"]["scheduler_present"] is True
@@ -534,6 +552,38 @@ def test_workspaces_issue_token_allows_supplied_idempotency_header() -> None:
     assert json.loads(req.content.decode()) == {"name": "bot", "agent_token": "at"}
 
 
+def test_workspaces_issue_token_accepts_hosted_principal_uid_body() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "workspace_id": "ws",
+                "token_id": "t1",
+                "name": "n",
+                "workspace_token": "secret",
+                "agent_uid": 501,
+                "principal_uid": 501,
+                "read_prefixes": [],
+                "write_prefixes": [],
+                "base_ref": "main",
+                "session_ref": None,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as raw:
+        client = StratumClient("http://example.test/", http_client=raw)
+        client.workspaces.issue_token("ws-1", {"name": "bot", "principal_uid": 501})
+
+    req = seen[0]
+    assert req.method == "POST"
+    assert req.url.path == "/workspaces/ws-1/tokens"
+    assert json.loads(req.content.decode()) == {"name": "bot", "principal_uid": 501}
+
+
 def test_workspace_constructor_compatibility_auth() -> None:
     calls: list[httpx.Request] = []
 
@@ -554,6 +604,23 @@ def test_workspace_constructor_compatibility_auth() -> None:
     assert calls[0].headers["Authorization"] == "Bearer sekret"
     assert calls[0].headers["X-Stratum-Workspace"] == "w9"
     assert calls[0].headers["X-Stratum-Repo"] == "repo-9"
+
+
+def test_workspace_record_types_include_hosted_scope() -> None:
+    workspace: WorkspaceRecord = {
+        "id": "ws-1",
+        "name": "Acme review",
+        "root_path": "/contracts",
+        "head_commit": None,
+        "version": 1,
+        "base_ref": "main",
+        "session_ref": "agent/acme",
+        "org_id": "org-acme",
+        "repo_id": "repo-acme",
+    }
+
+    assert workspace["org_id"] == "org-acme"
+    assert workspace["repo_id"] == "repo-acme"
 
 
 def test_stratum_client_context_manager_closes_owned_http_client() -> None:

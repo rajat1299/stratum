@@ -23,9 +23,9 @@ const fixture = JSON.parse(
 
 describe("bash sdk conformance fixture", () => {
   it("loads revision and case ids from the shared fixture", () => {
-    expect(fixture.revision).toBe("2026-06-04-1");
+    expect(fixture.revision).toBe("2026-06-08-1");
     expect(fixture.modes).toContain("durable-cloud");
-    expect(fixture.cases.some((entry) => entry.id === "unsupported.durable.workspaces")).toBe(
+    expect(fixture.cases.some((entry) => entry.id === "auth.durable.workspaces.missing")).toBe(
       true,
     );
   });

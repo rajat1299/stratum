@@ -217,6 +217,15 @@ pub trait WorkspaceMetadataStore: Send + Sync {
             .await?
             .filter(|workspace| workspace_matches_org_repo(workspace, org_id, repo_id)))
     }
+    async fn get_workspace_principal_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        principal_uid: Uid,
+    ) -> Result<Option<WorkspacePrincipalRecord>, VfsError> {
+        let _ = (org_id, repo_id, principal_uid);
+        Ok(None)
+    }
     async fn update_head_commit(
         &self,
         id: Uuid,

@@ -751,7 +751,7 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).expect("read conformance fixture"))
                 .expect("parse conformance fixture");
-        assert_eq!(fixture["revision"], "2026-06-04-1");
+        assert_eq!(fixture["revision"], "2026-06-08-1");
         let unsupported = fixture["cases"]
             .as_array()
             .expect("cases array")

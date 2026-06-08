@@ -129,6 +129,7 @@ function settingsFetch(capabilities: SafeCapabilities = loadLocalFixture()): typ
         name: "Review bot",
         workspace_token: "st_ws_secret",
         agent_uid: 101,
+        principal_uid: 101,
         read_prefixes: ["/contracts"],
         write_prefixes: ["/contracts/redlines"],
         base_ref: "main",
@@ -270,20 +271,34 @@ describe("SettingsPlaceholder", () => {
     });
   });
 
-  it("explains hosted-preview workspace limits without calling unavailable workspace routes", async () => {
+  it("issues hosted workspace tokens with an agent ID", async () => {
     renderSettings(settingsFetch(loadDurableCloudFixture()));
+    await screen.findAllByText("Acme review");
 
-    expect(
-      await screen.findAllByText(/workspace setup is not available in this hosted preview/i),
-    ).not.toHaveLength(0);
-    expect(
-      screen.getByText(/access token issuance is not available in this hosted preview/i),
-    ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Create workspace" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Issue token" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Token name"), {
+      target: { value: "Review bot" },
+    });
+    fireEvent.change(screen.getByLabelText("Agent ID"), {
+      target: { value: "501" },
+    });
+    fireEvent.change(screen.getByLabelText("Read access"), {
+      target: { value: "/contracts" },
+    });
+    fireEvent.change(screen.getByLabelText("Write access"), {
+      target: { value: "/contracts/redlines" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Issue token" }));
 
-    await waitFor(() => expect(recordedRequests).toContain("GET /v1/capabilities"));
-    expect(recordedRequests.some((request) => request.includes("/workspaces"))).toBe(false);
+    expect(await screen.findByText("st_ws_secret")).toBeTruthy();
+    expect(recordedPosts).toContainEqual({
+      url: "http://localhost:3000/workspaces/ws-1/tokens",
+      body: {
+        name: "Review bot",
+        principal_uid: 501,
+        read_prefixes: ["/contracts"],
+        write_prefixes: ["/contracts/redlines"],
+      },
+    });
   });
 
   it("explains unsupported protection groups without calling their endpoints", async () => {

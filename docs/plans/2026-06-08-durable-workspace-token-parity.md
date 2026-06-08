@@ -1,10 +1,10 @@
 # Durable Workspace And Token Parity Plan
 
-Status: ready for implementation after the private-beta contract.
+Status: implemented for Task 4.
 Date: 2026-06-08.
 
-This plan closes the current durable workspace/token gap without weakening the
-hosted safety boundary.
+This plan closes the durable workspace/token gap without weakening the hosted
+safety boundary.
 
 ## Current State
 
@@ -13,19 +13,16 @@ workspace tokens. It can store durable workspaces, scoped token hashes, token
 versions, revocation state, repo identity, org identity, and durable
 principals.
 
-The hosted HTTP router still marks `/workspaces` as unsupported. That is
-intentional for now. The current token issuance route accepts a local
-`agent_token` and asks the core runtime to authenticate it. Durable core does
-not authenticate local agent tokens, so exposing the route as-is would create a
-broken hosted path.
+The hosted HTTP router now mounts `/workspaces`. Local token issuance still
+uses `agent_token`; durable token issuance uses a hosted Agent ID and rejects
+local agent-token request bodies.
 
-For private beta, hosted durable workspaces and workspace tokens remain
-set up by an operator ahead of time. The hosted route must not fall back to
-local `.vfs` state.
+For private beta, hosted durable workspace setup remains an operator path. The
+hosted route must not fall back to local `.vfs` state.
 
-## Supported Beta Path Until This Lands
+## Supported Beta Path
 
-Hosted durable beta setup is handled by an operator ahead of time:
+Hosted durable beta setup is handled by an operator:
 
 1. Create the repo binding in the durable control plane.
 2. Create the durable workspace with org, repo, base ref, and session ref.

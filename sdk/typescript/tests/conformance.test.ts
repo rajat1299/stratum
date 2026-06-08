@@ -55,12 +55,13 @@ function recordFetch(response: Response = Response.json({ revision: fixture.capa
 describe("conformance.routes.v1.json", () => {
   it("loads revision, modes, and case ids", () => {
     expect(fixture.version).toBe(1);
-    expect(fixture.revision).toBe("2026-06-04-1");
+    expect(fixture.revision).toBe("2026-06-08-1");
     expect(fixture.modes).toEqual(["local-state", "durable-cloud"]);
     expect(fixture.cases.map((entry) => entry.id)).toEqual(
       expect.arrayContaining([
         "capabilities.local.public",
         "capabilities.durable.public",
+        "auth.durable.workspaces.missing",
         "unsupported.durable.execute",
       ]),
     );

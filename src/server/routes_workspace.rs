@@ -9,11 +9,11 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::idempotency as http_idempotency;
-use super::middleware::session_from_headers;
+use super::middleware::require_admin_or_durable_admin_principal;
 use super::repo_context::RequestTenantRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
+use crate::auth::Uid;
 use crate::auth::session::Session;
-use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
 use crate::error::VfsError;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyQuotaIdentity, IdempotencyReplayClassification,
@@ -45,7 +45,10 @@ pub struct CreateWorkspaceRequest {
 #[derive(Deserialize)]
 pub struct IssueTokenRequest {
     pub name: String,
+    #[serde(default)]
     pub agent_token: String,
+    #[serde(default)]
+    pub principal_uid: Option<Uid>,
     #[serde(default)]
     pub read_prefixes: Option<Vec<String>>,
     #[serde(default)]
@@ -86,7 +89,7 @@ struct IssueWorkspaceTokenFingerprint<'a> {
     repo_id: Option<&'a str>,
     workspace_id: Uuid,
     name: &'a str,
-    agent_uid: Uid,
+    principal_uid: Uid,
     read_prefixes: &'a [String],
     write_prefixes: &'a [String],
 }
@@ -132,34 +135,8 @@ fn current_unix_time() -> u64 {
         .max(1)
 }
 
-fn require_admin_session(session: &Session) -> Result<(), VfsError> {
-    if session.scope.is_some() {
-        return Err(VfsError::PermissionDenied {
-            path: "workspace metadata".to_string(),
-        });
-    }
-
-    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
-    if !principal_admin {
-        return Err(VfsError::PermissionDenied {
-            path: "workspace metadata".to_string(),
-        });
-    }
-    if let Some(delegate) = &session.delegate {
-        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
-        if !delegate_admin {
-            return Err(VfsError::PermissionDenied {
-                path: "workspace metadata".to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session, VfsError> {
-    let session = session_from_headers(state, headers).await?;
-    require_admin_session(&session)?;
-    Ok(session)
+    require_admin_or_durable_admin_principal(state, headers, "workspace metadata").await
 }
 
 fn resolve_admin_repo_context(
@@ -406,7 +383,7 @@ struct IssueWorkspaceTokenIdempotencyContext<'a> {
     repo: &'a RequestTenantRepoContext,
     workspace_id: Uuid,
     req: &'a IssueTokenRequest,
-    agent_uid: Uid,
+    principal_uid: Uid,
     read_prefixes: &'a [String],
     write_prefixes: &'a [String],
 }
@@ -446,7 +423,7 @@ async fn begin_issue_workspace_token_idempotency(
             repo_id: (!ctx.repo.is_local_singleton()).then_some(ctx.repo.repo_id().as_str()),
             workspace_id: ctx.workspace_id,
             name: &ctx.req.name,
-            agent_uid: ctx.agent_uid,
+            principal_uid: ctx.principal_uid,
             read_prefixes: ctx.read_prefixes,
             write_prefixes: ctx.write_prefixes,
         },
@@ -517,6 +494,78 @@ async fn begin_issue_workspace_token_idempotency(
             .unwrap_or_else(workspace_token_idempotency_failure_response),
         ),
     }
+}
+
+async fn resolve_issue_principal_uid(
+    state: &AppState,
+    req: &IssueTokenRequest,
+    repo: &RequestTenantRepoContext,
+) -> Result<Uid, axum::response::Response> {
+    let durable_cloud = state.core.durable_core_repo_id().is_some();
+    let has_agent_token = !req.agent_token.trim().is_empty();
+    let has_principal_uid = req.principal_uid.is_some();
+
+    if has_agent_token && has_principal_uid {
+        return Err(err_json(
+            StatusCode::BAD_REQUEST,
+            "Use either agent_token or principal_uid, not both.",
+        )
+        .into_response());
+    }
+
+    if durable_cloud {
+        if has_agent_token {
+            return Err(err_json(
+                StatusCode::BAD_REQUEST,
+                "Use principal_uid when issuing hosted workspace tokens.",
+            )
+            .into_response());
+        }
+        let Some(principal_uid) = req.principal_uid else {
+            return Err(err_json(
+                StatusCode::BAD_REQUEST,
+                "principal_uid is required for hosted workspace token issuance.",
+            )
+            .into_response());
+        };
+        return match state
+            .workspaces
+            .get_workspace_principal_for_org_repo(repo.org_id(), repo.repo_id(), principal_uid)
+            .await
+        {
+            Ok(Some(_principal)) => Ok(principal_uid),
+            Ok(None) => Err(err_json(
+                StatusCode::NOT_FOUND,
+                format!("unknown workspace principal: {principal_uid}"),
+            )
+            .into_response()),
+            Err(e) => Err(
+                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response(),
+            ),
+        };
+    }
+
+    if has_principal_uid {
+        return Err(err_json(
+            StatusCode::BAD_REQUEST,
+            "agent_token is required for local workspace token issuance.",
+        )
+        .into_response());
+    }
+    if !has_agent_token {
+        return Err(err_json(
+            StatusCode::BAD_REQUEST,
+            "agent_token is required for local workspace token issuance.",
+        )
+        .into_response());
+    }
+
+    state
+        .core
+        .authenticate_token(&req.agent_token)
+        .await
+        .map(|session| session.uid)
+        .map_err(|e| err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response())
 }
 
 async fn begin_create_workspace_idempotency(
@@ -802,13 +851,6 @@ async fn issue_workspace_token(
         .into_response();
     }
 
-    let agent_session = match state.core.authenticate_token(&req.agent_token).await {
-        Ok(session) => session,
-        Err(e) => {
-            return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response();
-        }
-    };
-
     let repo = match resolve_admin_repo_context(&state, &headers, &session) {
         Ok(repo) => repo,
         Err(e) => {
@@ -834,6 +876,10 @@ async fn issue_workspace_token(
             )
             .into_response();
         }
+    };
+    let principal_uid = match resolve_issue_principal_uid(&state, &req, &repo).await {
+        Ok(principal_uid) => principal_uid,
+        Err(response) => return response,
     };
     let requested_read_prefixes = req
         .read_prefixes
@@ -866,7 +912,7 @@ async fn issue_workspace_token(
             repo: &repo,
             workspace_id: id,
             req: &req,
-            agent_uid: agent_session.uid,
+            principal_uid,
             read_prefixes: &read_prefixes,
             write_prefixes: &write_prefixes,
         },
@@ -877,19 +923,33 @@ async fn issue_workspace_token(
         Err(response) => return response,
     };
 
-    match state
-        .workspaces
-        .issue_scoped_workspace_token_for_org_repo(
-            repo.org_id(),
-            repo.repo_id(),
-            id,
-            &req.name,
-            agent_session.uid,
-            read_prefixes,
-            write_prefixes,
-        )
-        .await
-    {
+    let issue_result = if repo.is_local_singleton() {
+        state
+            .workspaces
+            .issue_scoped_workspace_token(
+                id,
+                &req.name,
+                principal_uid,
+                read_prefixes,
+                write_prefixes,
+            )
+            .await
+    } else {
+        state
+            .workspaces
+            .issue_scoped_workspace_token_for_org_repo(
+                repo.org_id(),
+                repo.repo_id(),
+                id,
+                &req.name,
+                principal_uid,
+                read_prefixes,
+                write_prefixes,
+            )
+            .await
+    };
+
+    match issue_result {
         Ok(issued) => {
             let body = serde_json::json!({
                 "workspace_id": id,
@@ -897,6 +957,7 @@ async fn issue_workspace_token(
                 "name": &issued.token.name,
                 "workspace_token": &issued.raw_secret,
                 "agent_uid": issued.token.agent_uid,
+                "principal_uid": issued.token.principal_uid,
                 "read_prefixes": &issued.token.read_prefixes,
                 "write_prefixes": &issued.token.write_prefixes,
                 "base_ref": &workspace.base_ref,
@@ -913,6 +974,7 @@ async fn issue_workspace_token(
             .with_detail("workspace_id", id)
             .with_detail("token_name", &issued.token.name)
             .with_detail("agent_uid", issued.token.agent_uid)
+            .with_detail("principal_uid", principal_uid)
             .with_detail("read_prefix_count", issued.token.read_prefixes.len())
             .with_detail("write_prefix_count", issued.token.write_prefixes.len());
             if let Err(error) = state.audit.append(issue_audit).await {
@@ -1127,7 +1189,8 @@ async fn revoke_workspace_token(
 mod tests {
     use super::*;
     use crate::auth::session::Session;
-    use crate::backend::{OrgId, RepoId};
+    use crate::auth::{ROOT_GID, ROOT_UID, WHEEL_GID};
+    use crate::backend::{OrgId, RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
@@ -1137,7 +1200,8 @@ mod tests {
     use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, LocalWorkspaceMetadataStore,
-        ValidWorkspaceToken, WorkspaceMetadataStore, WorkspaceRecord, WorkspaceTokenRecord,
+        ValidWorkspaceToken, WorkspaceMetadataStore, WorkspacePrincipalKind,
+        WorkspacePrincipalRecord, WorkspaceRecord, WorkspaceTokenRecord,
     };
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -1356,11 +1420,706 @@ mod tests {
         headers
     }
 
+    fn workspace_bearer_headers_for_org_repo(
+        raw_secret: &str,
+        workspace_id: Uuid,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+    ) -> HeaderMap {
+        let mut headers = workspace_bearer_headers(raw_secret, workspace_id);
+        headers.insert("x-stratum-org", org_id.as_str().parse().unwrap());
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+        headers
+    }
+
+    struct DurableWorkspaceRouteStore {
+        inner: InMemoryWorkspaceMetadataStore,
+        admin_workspace: WorkspaceRecord,
+        admin_token: WorkspaceTokenRecord,
+        admin_principal: WorkspacePrincipalRecord,
+        admin_raw_secret: String,
+        principals: std::sync::Mutex<
+            std::collections::HashMap<(String, String, Uid), WorkspacePrincipalRecord>,
+        >,
+    }
+
+    impl DurableWorkspaceRouteStore {
+        fn new(org_id: &OrgId, repo_id: &RepoId) -> Self {
+            let admin_workspace_id = Uuid::new_v4();
+            let admin_raw_secret = format!("durable-admin-token-{admin_workspace_id}");
+            let admin_principal = WorkspacePrincipalRecord {
+                uid: ROOT_UID,
+                username: "durable-admin".to_string(),
+                gid: ROOT_GID,
+                groups: vec![ROOT_GID, WHEEL_GID],
+                kind: WorkspacePrincipalKind::Agent,
+                active: true,
+                org_id: Some(org_id.as_str().to_string()),
+            };
+            let mut principals = std::collections::HashMap::new();
+            principals.insert(
+                (
+                    org_id.as_str().to_string(),
+                    repo_id.as_str().to_string(),
+                    admin_principal.uid,
+                ),
+                admin_principal.clone(),
+            );
+            Self {
+                inner: InMemoryWorkspaceMetadataStore::new(),
+                admin_workspace: WorkspaceRecord {
+                    id: admin_workspace_id,
+                    name: "durable-admin".to_string(),
+                    root_path: "/admin".to_string(),
+                    head_commit: None,
+                    version: 1,
+                    base_ref: crate::vcs::MAIN_REF.to_string(),
+                    session_ref: Some("agent/admin/session".to_string()),
+                    org_id: Some(org_id.as_str().to_string()),
+                    repo_id: Some(repo_id.as_str().to_string()),
+                },
+                admin_token: WorkspaceTokenRecord {
+                    id: Uuid::new_v4(),
+                    workspace_id: admin_workspace_id,
+                    name: "admin".to_string(),
+                    agent_uid: ROOT_UID,
+                    secret_hash: "redacted".to_string(),
+                    read_prefixes: vec!["/admin".to_string()],
+                    write_prefixes: vec!["/admin".to_string()],
+                    org_id: Some(org_id.as_str().to_string()),
+                    principal_uid: Some(ROOT_UID),
+                    token_version: 1,
+                    issued_at_unix: 1,
+                    updated_at_unix: 1,
+                    expires_at_unix: None,
+                    revoked_at_unix: None,
+                },
+                admin_principal,
+                admin_raw_secret,
+                principals: std::sync::Mutex::new(principals),
+            }
+        }
+
+        fn admin_headers(&self, org_id: &OrgId, repo_id: &RepoId) -> HeaderMap {
+            workspace_bearer_headers_for_org_repo(
+                &self.admin_raw_secret,
+                self.admin_workspace.id,
+                org_id,
+                repo_id,
+            )
+        }
+
+        fn insert_principal(
+            &self,
+            org_id: &OrgId,
+            repo_id: &RepoId,
+            principal: WorkspacePrincipalRecord,
+        ) {
+            self.principals.lock().unwrap().insert(
+                (
+                    org_id.as_str().to_string(),
+                    repo_id.as_str().to_string(),
+                    principal.uid,
+                ),
+                principal,
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for DurableWorkspaceRouteStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            self.inner.list_workspaces().await
+        }
+
+        async fn list_workspaces_for_org_repo(
+            &self,
+            org_id: &OrgId,
+            repo_id: &RepoId,
+        ) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            self.inner
+                .list_workspaces_for_org_repo(org_id, repo_id)
+                .await
+        }
+
+        async fn create_workspace(
+            &self,
+            name: &str,
+            root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            self.inner.create_workspace(name, root_path).await
+        }
+
+        async fn create_workspace_with_refs_for_org_repo(
+            &self,
+            org_id: OrgId,
+            repo_id: RepoId,
+            name: &str,
+            root_path: &str,
+            base_ref: &str,
+            session_ref: Option<&str>,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            self.inner
+                .create_workspace_with_refs_for_org_repo(
+                    org_id,
+                    repo_id,
+                    name,
+                    root_path,
+                    base_ref,
+                    session_ref,
+                )
+                .await
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.get_workspace(id).await
+        }
+
+        async fn get_workspace_for_org_repo(
+            &self,
+            org_id: &OrgId,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner
+                .get_workspace_for_org_repo(org_id, repo_id, id)
+                .await
+        }
+
+        async fn update_head_commit(
+            &self,
+            id: Uuid,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.update_head_commit(id, head_commit).await
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            id: Uuid,
+            expected_head_commit: Option<&str>,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner
+                .update_head_commit_if_current(id, expected_head_commit, head_commit)
+                .await
+        }
+
+        async fn issue_scoped_workspace_token_for_org_repo(
+            &self,
+            org_id: &OrgId,
+            repo_id: &RepoId,
+            workspace_id: Uuid,
+            name: &str,
+            agent_uid: Uid,
+            read_prefixes: Vec<String>,
+            write_prefixes: Vec<String>,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            self.inner
+                .issue_scoped_workspace_token_for_org_repo(
+                    org_id,
+                    repo_id,
+                    workspace_id,
+                    name,
+                    agent_uid,
+                    read_prefixes,
+                    write_prefixes,
+                )
+                .await
+        }
+
+        async fn validate_workspace_token_at(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+            now_unix: u64,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            if workspace_id == self.admin_workspace.id && raw_secret == self.admin_raw_secret {
+                return Ok(Some(ValidWorkspaceToken {
+                    workspace: self.admin_workspace.clone(),
+                    token: self.admin_token.clone(),
+                    org_id: self.admin_workspace.org_id.clone(),
+                    repo_id: self.admin_workspace.repo_id.clone(),
+                    principal: Some(self.admin_principal.clone()),
+                }));
+            }
+            self.inner
+                .validate_workspace_token_at(workspace_id, raw_secret, now_unix)
+                .await
+        }
+
+        async fn revoke_workspace_token(
+            &self,
+            workspace_id: Uuid,
+            token_id: Uuid,
+            now_unix: u64,
+        ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+            self.inner
+                .revoke_workspace_token(workspace_id, token_id, now_unix)
+                .await
+        }
+
+        async fn get_workspace_principal_for_org_repo(
+            &self,
+            org_id: &OrgId,
+            repo_id: &RepoId,
+            principal_uid: Uid,
+        ) -> Result<Option<WorkspacePrincipalRecord>, VfsError> {
+            let principal = self
+                .principals
+                .lock()
+                .unwrap()
+                .get(&(
+                    org_id.as_str().to_string(),
+                    repo_id.as_str().to_string(),
+                    principal_uid,
+                ))
+                .filter(|principal| {
+                    principal.active && principal.org_id.as_deref() == Some(org_id.as_str())
+                })
+                .cloned();
+            Ok(principal)
+        }
+    }
+
+    #[derive(Default)]
+    struct LocalIssueRouteStore {
+        inner: InMemoryWorkspaceMetadataStore,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for LocalIssueRouteStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            self.inner.list_workspaces().await
+        }
+
+        async fn create_workspace(
+            &self,
+            name: &str,
+            root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            self.inner.create_workspace(name, root_path).await
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.get_workspace(id).await
+        }
+
+        async fn get_workspace_for_org_repo(
+            &self,
+            org_id: &OrgId,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner
+                .get_workspace_for_org_repo(org_id, repo_id, id)
+                .await
+        }
+
+        async fn update_head_commit(
+            &self,
+            id: Uuid,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.update_head_commit(id, head_commit).await
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            id: Uuid,
+            expected_head_commit: Option<&str>,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner
+                .update_head_commit_if_current(id, expected_head_commit, head_commit)
+                .await
+        }
+
+        async fn issue_scoped_workspace_token(
+            &self,
+            workspace_id: Uuid,
+            name: &str,
+            agent_uid: Uid,
+            read_prefixes: Vec<String>,
+            write_prefixes: Vec<String>,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            self.inner
+                .issue_scoped_workspace_token(
+                    workspace_id,
+                    name,
+                    agent_uid,
+                    read_prefixes,
+                    write_prefixes,
+                )
+                .await
+        }
+
+        async fn issue_scoped_workspace_token_for_org_repo(
+            &self,
+            _org_id: &OrgId,
+            _repo_id: &RepoId,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: Uid,
+            _read_prefixes: Vec<String>,
+            _write_prefixes: Vec<String>,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            Err(VfsError::NotSupported {
+                message: "local route must not use hosted token issuance".to_string(),
+            })
+        }
+
+        async fn validate_workspace_token_at(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+            now_unix: u64,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            self.inner
+                .validate_workspace_token_at(workspace_id, raw_secret, now_unix)
+                .await
+        }
+    }
+
+    fn durable_workspace_state(
+        org_id: OrgId,
+        repo_id: RepoId,
+    ) -> (AppState, Arc<DurableWorkspaceRouteStore>, HeaderMap) {
+        let stores = StratumStores::local_memory();
+        let workspaces = Arc::new(DurableWorkspaceRouteStore::new(&org_id, &repo_id));
+        let headers = workspaces.admin_headers(&org_id, &repo_id);
+        let state = Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id.clone(),
+                stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces: workspaces.clone(),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
+            secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
+        });
+        state.bind_tenant_repo_for_test(org_id, repo_id);
+        (state, workspaces, headers)
+    }
+
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn durable_admin_can_create_list_get_issue_and_revoke_workspace_token() {
+        let org_id = OrgId::default_org();
+        let repo_id = RepoId::new("repo_durable_workspace_parity").unwrap();
+        let (state, workspaces, headers) = durable_workspace_state(org_id.clone(), repo_id.clone());
+        let agent_principal = WorkspacePrincipalRecord {
+            uid: 501,
+            username: "durable-agent".to_string(),
+            gid: 501,
+            groups: vec![501],
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+            org_id: Some(OrgId::default_org().as_str().to_string()),
+        };
+        workspaces.insert_principal(&org_id, &repo_id, agent_principal.clone());
+
+        let created = create_workspace(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: Some("main".to_string()),
+                session_ref: Some("agent/demo/session".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        let workspace_id =
+            Uuid::parse_str(created_body["id"].as_str().expect("workspace id")).unwrap();
+        assert_eq!(created_body["repo_id"], "repo_durable_workspace_parity");
+        assert_eq!(created_body["org_id"], "default_org");
+
+        let listed = list_workspaces(State(state.clone()), headers.clone())
+            .await
+            .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json(listed).await;
+        assert_eq!(listed_body["workspaces"].as_array().unwrap().len(), 1);
+
+        let fetched = get_workspace(State(state.clone()), headers.clone(), Path(workspace_id))
+            .await
+            .into_response();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        assert_eq!(response_json(fetched).await["id"], workspace_id.to_string());
+
+        let issued = issue_workspace_token(
+            State(state.clone()),
+            headers.clone(),
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "demo-agent".to_string(),
+                agent_token: String::new(),
+                principal_uid: Some(agent_principal.uid),
+                read_prefixes: Some(vec!["/demo".to_string()]),
+                write_prefixes: Some(vec!["/demo/src".to_string()]),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(issued.status(), StatusCode::OK);
+        let issued_body = response_json(issued).await;
+        assert_eq!(issued_body["agent_uid"], agent_principal.uid);
+        assert_eq!(issued_body["principal_uid"], agent_principal.uid);
+        assert!(issued_body["workspace_token"].as_str().is_some());
+        let token_id =
+            Uuid::parse_str(issued_body["token_id"].as_str().expect("token id")).unwrap();
+
+        let revoked = revoke_workspace_token(State(state), headers, Path((workspace_id, token_id)))
+            .await
+            .into_response();
+
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let revoked_body = response_json(revoked).await;
+        assert_eq!(revoked_body["token_id"], token_id.to_string());
+        assert_eq!(revoked_body["principal_uid"], agent_principal.uid);
+        assert!(revoked_body["revoked_at_unix"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn durable_token_issue_rejects_local_agent_token_shape() {
+        let org_id = OrgId::default_org();
+        let repo_id = RepoId::new("repo_durable_workspace_token_shape").unwrap();
+        let (state, _workspaces, headers) = durable_workspace_state(org_id, repo_id);
+        let created = create_workspace(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/demo/session".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let created_body = response_json(created).await;
+        let workspace_id =
+            Uuid::parse_str(created_body["id"].as_str().expect("workspace id")).unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            headers,
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "demo-agent".to_string(),
+                agent_token: "local-agent-token".to_string(),
+                principal_uid: None,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("principal_uid")
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_token_issue_requires_active_principal_for_exact_org_repo() {
+        let org_id = OrgId::default_org();
+        let repo_id = RepoId::new("repo_durable_workspace_principal_scope").unwrap();
+        let other_repo_id = RepoId::new("repo_durable_workspace_other").unwrap();
+        let (state, workspaces, headers) = durable_workspace_state(org_id.clone(), repo_id.clone());
+        let principal =
+            |uid, username: &str, active, principal_org: &OrgId| WorkspacePrincipalRecord {
+                uid,
+                username: username.to_string(),
+                gid: uid,
+                groups: vec![uid],
+                kind: WorkspacePrincipalKind::Agent,
+                active,
+                org_id: Some(principal_org.as_str().to_string()),
+            };
+        workspaces.insert_principal(
+            &org_id,
+            &repo_id,
+            principal(601, "inactive-agent", false, &org_id),
+        );
+        let other_org = OrgId::new("other_org").unwrap();
+        workspaces.insert_principal(
+            &org_id,
+            &repo_id,
+            principal(602, "wrong-org-agent", true, &other_org),
+        );
+        workspaces.insert_principal(
+            &org_id,
+            &other_repo_id,
+            principal(603, "wrong-repo-agent", true, &org_id),
+        );
+
+        let created = create_workspace(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/demo/session".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        let workspace_id =
+            Uuid::parse_str(created_body["id"].as_str().expect("workspace id")).unwrap();
+
+        for principal_uid in [601, 602, 603, 604] {
+            let response = issue_workspace_token(
+                State(state.clone()),
+                headers.clone(),
+                Path(workspace_id),
+                Json(IssueTokenRequest {
+                    name: format!("demo-agent-{principal_uid}"),
+                    agent_token: String::new(),
+                    principal_uid: Some(principal_uid),
+                    read_prefixes: None,
+                    write_prefixes: None,
+                }),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(
+                response_json(response).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown workspace principal")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_token_issue_requires_principal_uid() {
+        let org_id = OrgId::default_org();
+        let repo_id = RepoId::new("repo_durable_workspace_missing_principal").unwrap();
+        let (state, _workspaces, headers) = durable_workspace_state(org_id, repo_id);
+        let created = create_workspace(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/demo/session".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        let workspace_id =
+            Uuid::parse_str(created_body["id"].as_str().expect("workspace id")).unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            headers,
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "demo-agent".to_string(),
+                agent_token: String::new(),
+                principal_uid: None,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("principal_uid is required")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_token_issue_rejects_principal_uid_shape() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "ci-agent").await;
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let principal_only = issue_workspace_token(
+            State(state.clone()),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-agent".to_string(),
+                agent_token: String::new(),
+                principal_uid: Some(501),
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(principal_only.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response_json(principal_only).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("agent_token is required")
+        );
+
+        let both = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-agent".to_string(),
+                agent_token: raw_agent_token,
+                principal_uid: Some(501),
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(both.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response_json(both).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("either agent_token or principal_uid")
+        );
     }
 
     struct FailingAuditStore;
@@ -1756,6 +2515,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "org-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -1833,6 +2593,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "cross-org-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -1848,6 +2609,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "org-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2008,6 +2770,7 @@ mod tests {
         let req = IssueTokenRequest {
             name: "demo-token".to_string(),
             agent_token: raw_agent_token.clone(),
+            principal_uid: None,
             read_prefixes: Some(vec!["/demo/read/./".to_string()]),
             write_prefixes: Some(vec!["/demo/write".to_string()]),
         };
@@ -2019,6 +2782,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: req.name.clone(),
                 agent_token: req.agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: req.read_prefixes.clone(),
                 write_prefixes: req.write_prefixes.clone(),
             }),
@@ -2054,7 +2818,7 @@ mod tests {
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: &req.name,
-                agent_uid: agent.uid,
+                principal_uid: agent.uid,
                 read_prefixes: &read_prefixes,
                 write_prefixes: &write_prefixes,
             },
@@ -2117,6 +2881,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2132,6 +2897,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "other-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2168,6 +2934,7 @@ mod tests {
         let req = IssueTokenRequest {
             name: "demo-token".to_string(),
             agent_token: raw_agent_token,
+            principal_uid: None,
             read_prefixes: None,
             write_prefixes: None,
         };
@@ -2190,7 +2957,7 @@ mod tests {
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: &req.name,
-                agent_uid: agent.uid,
+                principal_uid: agent.uid,
                 read_prefixes: &read_prefixes,
                 write_prefixes: &write_prefixes,
             },
@@ -2242,6 +3009,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2266,7 +3034,7 @@ mod tests {
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: "demo-token",
-                agent_uid: 1,
+                principal_uid: 1,
                 read_prefixes: std::slice::from_ref(&workspace.root_path),
                 write_prefixes: std::slice::from_ref(&workspace.root_path),
             },
@@ -2315,6 +3083,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2350,6 +3119,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: "not-valid".to_string(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2380,6 +3150,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2411,6 +3182,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2455,6 +3227,7 @@ mod tests {
         let request = || IssueTokenRequest {
             name: "demo-token".to_string(),
             agent_token: raw_agent_token.clone(),
+            principal_uid: None,
             read_prefixes: None,
             write_prefixes: None,
         };
@@ -2522,6 +3295,7 @@ mod tests {
         let request = || IssueTokenRequest {
             name: "demo-token".to_string(),
             agent_token: raw_agent_token.clone(),
+            principal_uid: None,
             read_prefixes: None,
             write_prefixes: None,
         };
@@ -2589,6 +3363,7 @@ mod tests {
         let request = || IssueTokenRequest {
             name: "demo-token".to_string(),
             agent_token: raw_agent_token.clone(),
+            principal_uid: None,
             read_prefixes: None,
             write_prefixes: None,
         };
@@ -2676,6 +3451,7 @@ mod tests {
         let request = || IssueTokenRequest {
             name: "demo-token".to_string(),
             agent_token: raw_agent_token.clone(),
+            principal_uid: None,
             read_prefixes: Some(vec!["/demo/read/./".to_string()]),
             write_prefixes: Some(vec!["/demo/write".to_string()]),
         };
@@ -2751,6 +3527,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: "not-valid".to_string(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -2772,10 +3549,12 @@ mod tests {
                 .unwrap(),
         );
         let local_only_db = StratumDb::open_memory();
+        let workspaces = Arc::new(LocalIssueRouteStore::default());
+        let workspace = workspaces.create_workspace("demo", "/demo").await.unwrap();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(core_db),
             db: ServerLocalDb::available(Arc::new(local_only_db)),
-            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            workspaces,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
@@ -2786,11 +3565,6 @@ mod tests {
             text_extraction: crate::server::unavailable_text_extraction_store(),
             embedding_provider: crate::server::unavailable_embedding_provider(),
         });
-        let workspace = state
-            .workspaces
-            .create_workspace("demo", "/demo")
-            .await
-            .unwrap();
 
         let response = issue_workspace_token(
             State(state),
@@ -2799,6 +3573,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -3124,6 +3899,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -3189,6 +3965,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -3243,6 +4020,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -3279,6 +4057,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: None,
                 write_prefixes: None,
             }),
@@ -3325,6 +4104,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: Some(vec![
                     "/demo/read".to_string(),
                     "/demo/shared/./".to_string(),
@@ -3373,6 +4153,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "deny-all-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: Some(Vec::new()),
                 write_prefixes: Some(Vec::new()),
             }),
@@ -3412,6 +4193,7 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "bad-token".to_string(),
                 agent_token: raw_agent_token,
+                principal_uid: None,
                 read_prefixes: Some(vec!["/demo/read".to_string()]),
                 write_prefixes: Some(vec!["/demo/../outside/write".to_string()]),
             }),

@@ -1,4 +1,5 @@
 import type {
+  IssueWorkspaceTokenOptions,
   IssueWorkspaceTokenResponse,
   ProtectedPathRule,
   WorkspaceRecord,
@@ -24,6 +25,8 @@ export function SettingsPlaceholder() {
   const workspaceListAvailable = capabilities.data?.routes.workspaces.list.available === true;
   const workspaceCreateAvailable = capabilities.data?.routes.workspaces.create.available === true;
   const workspaceTokenAvailable = capabilities.data?.routes.workspaces.issue_token.available === true;
+  const hostedTokenIdentity =
+    capabilities.data?.routes.workspaces.issue_token.requires?.includes("durable-principal-uid") === true;
   const refRulesAvailable = capabilities.data?.protection.ref_rules.available === true;
   const pathRulesAvailable = capabilities.data?.protection.path_rules.available === true;
   const workspaces = useQuery({
@@ -114,12 +117,16 @@ export function SettingsPlaceholder() {
       if (!workspaceTokenAvailable) {
         throw new Error("Access token issuance is not available in this hosted preview.");
       }
-      return client.workspaces.issueToken(selectedWorkspaceId, {
+      const identity = hostedTokenIdentity
+        ? { principal_uid: parseAgentId(tokenForm.agentToken) }
+        : { agent_token: tokenForm.agentToken.trim() };
+      const request: IssueWorkspaceTokenOptions = {
         name: tokenForm.name.trim(),
-        agent_token: tokenForm.agentToken.trim(),
+        ...identity,
         read_prefixes: parsePrefixes(tokenForm.readPrefixes),
         write_prefixes: parsePrefixes(tokenForm.writePrefixes),
-      });
+      };
+      return client.workspaces.issueToken(selectedWorkspaceId, request);
     },
     onSuccess: (response) => {
       setIssuedToken(response);
@@ -342,14 +349,30 @@ export function SettingsPlaceholder() {
                   placeholder="Review bot"
                   required
                 />
-                <TextField
-                  label="Agent token"
-                  value={tokenForm.agentToken}
-                  onChange={(value) => setTokenForm((current) => ({ ...current, agentToken: value }))}
-                  placeholder="Paste once"
-                  type="password"
-                  required
-                />
+                {hostedTokenIdentity ? (
+                  <TextField
+                    label="Agent ID"
+                    value={tokenForm.agentToken}
+                    onChange={(value) =>
+                      setTokenForm((current) => ({ ...current, agentToken: value }))
+                    }
+                    placeholder="501"
+                    type="number"
+                    min={0}
+                    required
+                  />
+                ) : (
+                  <TextField
+                    label="Agent token"
+                    value={tokenForm.agentToken}
+                    onChange={(value) =>
+                      setTokenForm((current) => ({ ...current, agentToken: value }))
+                    }
+                    placeholder="Paste once"
+                    type="password"
+                    required
+                  />
+                )}
                 <TextField
                   label="Read access"
                   value={tokenForm.readPrefixes}
@@ -731,6 +754,18 @@ function parsePrefixes(value: string): readonly string[] {
 function positiveInt(value: string): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function parseAgentId(value: string): number {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error("Enter a valid agent ID.");
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error("Enter a valid agent ID.");
+  }
+  return parsed;
 }
 
 function approvalLabel(count: number): string {
