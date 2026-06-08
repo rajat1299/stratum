@@ -1,6 +1,6 @@
 # Private Beta Contract
 
-Status: 2026-06-07. Capability manifest revision: `2026-06-04-2`.
+Status: 2026-06-08. Capability manifest revision: `2026-06-04-2`.
 
 This contract freezes what Stratum supports for private beta. It is grounded in
 `sdk/contracts/capabilities.v1.json`,
@@ -28,7 +28,7 @@ operations. It is not a hosted admin product yet.
 | Workspace source | Local Stratum state exposed as `/` through the HTTP workspace API. | Durable core state exposed as `/` for a pre-provisioned workspace. |
 | Required setup | Create local users, agents, directories, and demo content. | Operator pre-provisions the workspace, repo context, and session-ref. |
 | Client path | CLI setup plus HTTP API, with `stratumctl` as a thin client where available. | HTTP API or `stratumctl`-style calls with explicit workspace, repo, and session context. |
-| Workspace lifecycle | Workspace list/create and token issue/revoke routes are present in local-state. | Workspace list/create/token issue/revoke routes are unsupported right now. |
+| Workspace lifecycle | Workspace list/create and token issue/revoke routes are present in local-state. | Workspaces and tokens are set up by an operator ahead of time. The hosted HTTP workspace lifecycle routes stay unavailable until the durable admin path lands. |
 | Audit listing | Supported for user-admin sessions only. Bearer tokens are rejected. | Audit listing is unsupported right now. |
 | Execution | Not part of the beta contract. Default capabilities report `/execute` unavailable. | Unsupported. |
 | Semantic search | Unsupported in the beta contract. Local capabilities report it unavailable. | Unsupported in the checked-in durable manifest because the search index is unavailable. |
@@ -59,8 +59,8 @@ operations. It is not a hosted admin product yet.
 | VCS recovery | Unsupported. | Unsupported. |
 | Review and change-request routes | Supported, admin-gated, and idempotent where advertised. | Supported with explicit repo context and an admin-capable workspace session. |
 | Protected refs/paths | Supported. | Supported. |
-| Workspaces list/create | Supported in local-state. | Unsupported right now. |
-| Workspace token issue/revoke | Supported in local-state. Token issue is not idempotent unless secret replay KMS is configured; token revoke is not idempotent. | Unsupported right now. |
+| Workspaces list/create | Supported in local-state. | Set up by an operator ahead of time; hosted HTTP routes stay unavailable until the durable admin path lands. |
+| Workspace token issue/revoke | Supported in local-state. Token issue is not idempotent unless secret replay KMS is configured; token revoke is not idempotent. | Set up by an operator ahead of time; hosted HTTP routes stay unavailable until the durable admin path lands. |
 | Audit listing | Supported for user-admin sessions. | Unsupported right now. |
 | Runs | Record-only route is supported locally; it does not schedule execution. | Unsupported right now. |
 | Execute | Unavailable by default and outside the beta contract. | Unsupported right now. |
@@ -69,7 +69,7 @@ operations. It is not a hosted admin product yet.
 
 The private beta does not promise:
 
-- durable-cloud workspace list/create/token issue/revoke routes
+- durable-cloud HTTP workspace list/create/token issue/revoke routes
 - durable-cloud audit listing
 - hosted durable `/runs` or `/execute`
 - OIDC or SAML login readiness
@@ -100,10 +100,14 @@ single short demo script is still a close-out task.
 Hosted durable close-out remains narrower:
 
 - pre-provision the workspace before the customer flow starts
+- set up workspace tokens through an operator-owned durable admin path
 - pass explicit workspace and repo context on every hosted durable request
 - use a session-ref for mounted durable mutations
 - keep workspace lifecycle, token lifecycle, audit listing, runs, execute,
   semantic search, MCP, FUSE, and hosted admin screens out of the promised demo
+
+The implementation plan for durable workspace and token parity is tracked in
+`docs/plans/2026-06-08-durable-workspace-token-parity.md`.
 
 ## Operator Notes
 
