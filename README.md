@@ -108,6 +108,15 @@ Example demo content lives in [`examples/`](examples/):
 
 Authenticated endpoints accept `Authorization: Bearer <token>`. Loopback/localhost development servers also accept `Authorization: User <username>` and `/auth/login` identity assertions. `/health` is public.
 
+For the private-beta hosted durable preview, admin actions use an
+operator-provisioned, repo-bound hosted admin bearer: `Authorization: Bearer
+<workspace-secret>` with `X-Stratum-Workspace`, `X-Stratum-Repo`, and, when
+applicable, `X-Stratum-Org`. That admin bearer is separate from scoped agent
+tokens, which are issued for a declared workspace, prefix set, and session ref.
+Hosted durable admin does not accept local `User` auth, bare agent bearer
+tokens, `Stratum-Session` hosted login tokens, OIDC/SAML, or SCIM as
+private-beta login/admin paths.
+
 ### Filesystem
 
 | Method | Endpoint | Description |

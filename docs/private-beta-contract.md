@@ -15,10 +15,13 @@ API, and the local review/change-request routes for the beta review loop:
 workspace setup, scoped token, agent edit, change request, diff review,
 approval or rejection, merge, audit trail, and revert.
 
-Hosted durable is a narrower preview. It supports workspace setup and token
-management through a repo-bound operator admin path, plus a session-ref route
-surface for selected HTTP and `stratumctl`-style operations. It is not a hosted
-admin product yet.
+Hosted durable is a narrower preview. Its private-beta admin posture is an
+operator-provisioned, repo-bound hosted admin bearer: a workspace bearer token
+whose durable principal is active and root/wheel-scoped for the matching repo.
+That admin bearer can provision and manage hosted workspaces and scoped agent
+tokens. It is separate from normal scoped agent tokens, which can only edit
+within their declared prefixes and session refs. Hosted durable is not a
+hosted admin product yet.
 
 ## Support Matrix
 
@@ -27,7 +30,7 @@ admin product yet.
 | Runtime | `local-state` | `durable-cloud` |
 | Complete beta path | Yes. This is the supported end-to-end demo path. | No. Preview route surface only. |
 | Workspace source | Local Stratum state exposed as `/` through the HTTP workspace API. | Durable core state exposed as `/` for a repo-bound hosted workspace. |
-| Required setup | Create local users, agents, directories, and demo content. | Operator creates the repo context, admin workspace token, workspace, target agent identity, and session-ref. |
+| Required setup | Create local users, agents, directories, and demo content. | Operator creates the repo context, hosted admin bearer, workspace, target agent identity, scoped agent token, and session-ref. |
 | Client path | CLI setup plus HTTP API, with `stratumctl` as a thin client where available. | HTTP API or `stratumctl`-style calls with explicit workspace, repo, and session context. |
 | Workspace lifecycle | Workspace list/create and token issue/revoke routes are present in local-state. | Workspace list/create/get and token issue/revoke routes are available through the repo-bound durable admin path. |
 | Audit listing | Supported for user-admin sessions only. Bearer tokens are rejected. | Audit listing is unsupported right now. |
@@ -42,9 +45,14 @@ admin product yet.
 | Advertised auth modes | User, bearer, and workspace. | Workspace only. |
 | Local users | Available and default for local setup and admin actions. | Not available. |
 | Agent bearer tokens | Supported for local agent access. | Not the hosted durable contract by itself. Hosted durable uses workspace-scoped access. |
-| Workspace bearer access | Supported for workspace-scoped filesystem, search, and tree routes. | Required with explicit workspace and repo context. |
-| OIDC/SAML | Not ready for private beta. OIDC is advertised as unavailable; SAML is not part of the capability manifest. | Not ready for private beta. |
+| Workspace bearer access | Supported for workspace-scoped filesystem, search, and tree routes. | Required with explicit workspace and repo context. Hosted admin requires an operator-provisioned repo-bound bearer backed by an active root/wheel durable principal. |
+| OIDC/SAML/SCIM | Disabled foundations only. They are not private-beta login, admin, or provisioning paths. | Disabled foundations only. They are not private-beta login, admin, or provisioning paths. |
 | Hosted admin UI | Not applicable. | Not ready. Operators use the durable admin HTTP path or setup scripts. |
+
+Durable admin routes reject local `Authorization: User ...`, hosted
+`Authorization: Stratum-Session ...`, bearer tokens without matching
+workspace/repo binding, and bearer tokens whose durable principal is missing,
+inactive, or not root/wheel-scoped for the requested repo.
 
 ## Route Support
 
@@ -61,7 +69,7 @@ admin product yet.
 | Review and change-request routes | Supported, admin-gated, and idempotent where advertised. | Supported with explicit repo context and an admin-capable workspace session. |
 | Protected refs/paths | Supported. | Supported. |
 | Workspaces list/create/get | Supported in local-state. | Supported through a repo-bound admin workspace bearer. |
-| Workspace token issue/revoke | Supported in local-state. Token issue is not idempotent unless secret replay KMS is configured; token revoke is not idempotent. | Supported through a repo-bound admin workspace bearer. Token issue names the hosted agent by Agent ID. |
+| Workspace token issue/revoke | Supported in local-state. Token issue is not idempotent unless secret replay KMS is configured; token revoke is not idempotent. | Supported through the hosted admin bearer. Token issue names the hosted agent by Agent ID, which maps to `principal_uid` in the durable API. |
 | Audit listing | Supported for user-admin sessions. | Unsupported right now. |
 | Runs | Record-only route is supported locally; it does not schedule execution. | Unsupported right now. |
 | Execute | Unavailable by default and outside the beta contract. | Unsupported right now. |
@@ -73,6 +81,7 @@ The private beta does not promise:
 - durable-cloud audit listing
 - hosted durable `/runs` or `/execute`
 - OIDC or SAML login readiness
+- SCIM provisioning readiness
 - semantic search as a beta-ready product surface
 - audit export productization or hosted audit UI
 - durable MCP, durable FUSE, or direct durable-cloud REPL access
@@ -100,11 +109,12 @@ single short demo script is still a close-out task.
 Hosted durable close-out remains narrower:
 
 - create the hosted workspace before the customer flow starts
-- issue workspace tokens through an operator-owned durable admin path
+- issue scoped agent workspace tokens through an operator-provisioned,
+  repo-bound hosted admin bearer
 - pass explicit workspace and repo context on every hosted durable request
 - use a session-ref for mounted durable mutations
-- keep audit listing, runs, execute, semantic search, MCP, FUSE, and hosted
-  admin screens out of the promised demo
+- keep OIDC, SAML, SCIM, audit listing, runs, execute, semantic search, MCP,
+  FUSE, and hosted admin screens out of the promised demo
 
 The implementation plan for durable workspace and token parity is tracked in
 `docs/plans/2026-06-08-durable-workspace-token-parity.md`.
@@ -116,6 +126,9 @@ The implementation plan for durable workspace and token parity is tracked in
   bodies that may contain secrets.
 - Treat workspace bearer tokens as customer secrets. Use secret-manager or
   operator-controlled storage outside this repo for real deployments.
+- Do not put hosted admin bearer tokens in browser local storage or screenshots.
+  Use short-lived/operator-controlled handling and issue narrower scoped agent
+  tokens for the actual agent edit session.
 - When discussing examples, name the credential type instead of showing a fake
   value.
 - If durable-cloud returns an unsupported-route response, do not fall back to

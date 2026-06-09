@@ -1050,8 +1050,6 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
     let router = Router::new()
         .merge(routes_capabilities::routes())
         .merge(routes_auth::health_routes())
-        .merge(routes_auth::hosted_routes())
-        .merge(routes_scim::routes())
         .merge(routes_fs::durable_read_routes())
         .merge(routes_review::routes())
         .merge(routes_vcs::durable_read_routes())
@@ -1072,6 +1070,15 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
 fn durable_unsupported_routes() -> Router<AppState> {
     Router::new()
         .route("/auth/login", any(durable_cloud_route_not_supported))
+        .route("/auth/oidc/{*path}", any(durable_cloud_route_not_supported))
+        .route("/auth/saml/{*path}", any(durable_cloud_route_not_supported))
+        .route("/auth/refresh", any(durable_cloud_route_not_supported))
+        .route(
+            "/auth/refresh/revoke",
+            any(durable_cloud_route_not_supported),
+        )
+        .route("/scim/v2", any(durable_cloud_route_not_supported))
+        .route("/scim/v2/{*path}", any(durable_cloud_route_not_supported))
         .route("/runs", any(durable_cloud_route_not_supported))
         .route("/runs/{*path}", any(durable_cloud_route_not_supported))
         .route("/execute", any(durable_cloud_route_not_supported))
@@ -3341,6 +3348,14 @@ mod tests {
         );
         let unsupported = [
             (reqwest::Method::POST, "/auth/login"),
+            (reqwest::Method::POST, "/auth/oidc/login"),
+            (reqwest::Method::POST, "/auth/saml/login"),
+            (reqwest::Method::POST, "/auth/refresh"),
+            (reqwest::Method::POST, "/auth/refresh/revoke"),
+            (reqwest::Method::POST, "/scim/v2/Users"),
+            (reqwest::Method::PATCH, "/scim/v2/Users/demo-user"),
+            (reqwest::Method::POST, "/scim/v2/Groups"),
+            (reqwest::Method::PATCH, "/scim/v2/Groups/demo-group"),
             (reqwest::Method::POST, "/runs"),
             (reqwest::Method::GET, "/audit"),
             (reqwest::Method::GET, "/vcs/recovery"),

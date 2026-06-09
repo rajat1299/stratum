@@ -798,6 +798,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_cloud_admin_seam_rejects_stratum_session() {
+        let repo_id = RepoId::new("repo_durable_admin_stratum_session").unwrap();
+        let state = durable_cloud_state_for_repo(
+            repo_id.clone(),
+            Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        );
+        let identity = HostedSessionIdentity {
+            session_id: Uuid::new_v4(),
+            org_id: OrgId::default_org(),
+            repo_id: repo_id.clone(),
+            uid: ROOT_UID,
+            username: "hosted-root".to_string(),
+            gid: 0,
+            groups: vec![WHEEL_GID],
+            external_identity_id: "oidc:issuer:hosted-root".to_string(),
+        };
+        let issued = state
+            .hosted_auth
+            .issue_access_token(&identity, 10, u64::MAX);
+        let mut headers = stratum_session_headers(&issued.raw_secret);
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+        let err = require_admin_or_durable_admin_principal(&state, &headers, "admin operation")
+            .await
+            .expect_err("hosted access sessions must not satisfy durable admin");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
     async fn durable_cloud_admin_seam_accepts_repo_scoped_wheel_workspace_bearer() {
         let repo_id = RepoId::new("repo_durable_admin_wheel").unwrap();
         let workspace_id = Uuid::new_v4();
@@ -852,6 +882,31 @@ mod tests {
         .expect_err("non-wheel durable principal must fail");
 
         assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_admin_seam_rejects_inactive_wheel_principal() {
+        let repo_id = RepoId::new("repo_durable_admin_inactive").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-admin-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.principal_uid = Some(501);
+        let mut principal = durable_workspace_principal_with_groups(501, vec![WHEEL_GID]);
+        principal.active = false;
+        let mut store = durable_like_workspace_store(raw_secret.clone(), token, principal);
+        store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        let state = durable_cloud_state_for_repo(repo_id.clone(), Arc::new(store));
+
+        let err = require_admin_or_durable_admin_principal(
+            &state,
+            &repo_bearer_headers(&raw_secret, workspace_id, &repo_id),
+            "admin operation",
+        )
+        .await
+        .expect_err("inactive wheel durable principal must fail");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+        assert!(err.to_string().contains(INVALID_WORKSPACE_BEARER_TOKEN));
     }
 
     #[tokio::test]

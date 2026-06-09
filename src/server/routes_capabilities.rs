@@ -1037,6 +1037,26 @@ mod tests {
         assert!(!body.sources.provider_mounts.available);
         assert_eq!(body.routes.audit.requires, vec!["user-admin".to_string()]);
         assert_eq!(
+            body.auth.modes,
+            vec![
+                "user".to_string(),
+                "bearer".to_string(),
+                "workspace".to_string()
+            ]
+        );
+        assert!(
+            body.auth
+                .providers
+                .iter()
+                .any(|provider| provider.id == "local" && provider.available)
+        );
+        assert!(
+            body.auth
+                .providers
+                .iter()
+                .any(|provider| provider.id == "oidc" && !provider.available)
+        );
+        assert_eq!(
             body.routes.audit.notes.as_deref(),
             Some("Bearer tokens are rejected, including admin agent and workspace bearer tokens.")
         );
@@ -1138,6 +1158,18 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(body.auth.modes, vec!["workspace".to_string()]);
+        assert!(
+            body.auth
+                .providers
+                .iter()
+                .any(|provider| provider.id == "local" && !provider.available)
+        );
+        assert!(
+            body.auth
+                .providers
+                .iter()
+                .any(|provider| provider.id == "oidc" && !provider.available)
+        );
         assert!(body.routes.filesystem.read.available);
         assert!(body.routes.filesystem.write.available);
         assert!(body.routes.filesystem.patch.available);
@@ -1150,6 +1182,31 @@ mod tests {
             vec![
                 "workspace-bearer".to_string(),
                 "durable-session-ref".to_string(),
+            ]
+        );
+        assert_eq!(
+            body.routes.workspaces.create.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+            ]
+        );
+        assert_eq!(
+            body.routes.workspaces.issue_token.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+                "durable-principal-uid".to_string(),
+            ]
+        );
+        assert_eq!(
+            body.routes.workspaces.revoke_token.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
             ]
         );
         assert_eq!(

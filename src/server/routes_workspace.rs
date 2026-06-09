@@ -25,6 +25,8 @@ use crate::workspace::normalize_workspace_token_prefixes;
 const CREATE_WORKSPACE_IDEMPOTENCY_SCOPE: &str = "workspaces:create";
 const CREATE_WORKSPACE_IDEMPOTENCY_ROUTE: &str = "POST /workspaces";
 const ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE: &str = "POST /workspaces/{id}/tokens";
+const REVOKE_WORKSPACE_TOKEN_ROUTE: &str =
+    "POST /workspaces/{workspace_id}/tokens/{token_id}/revoke";
 const WORKSPACE_TOKEN_IDEMPOTENCY_REJECTION: &str = "secret replay KMS is unavailable";
 const WORKSPACE_TOKEN_IDEMPOTENCY_FAILURE: &str = "workspace-token idempotency replay failed";
 const WORKSPACE_TOKEN_COMPENSATION_FAILURE: &str =
@@ -201,6 +203,19 @@ fn admin_actor_fingerprint(session: &Session) -> AdminActorFingerprint<'_> {
     }
 }
 
+fn hosted_admin_audit_context(
+    event: NewAuditEvent,
+    repo: &RequestTenantRepoContext,
+    route: &'static str,
+    workspace_id: Uuid,
+) -> NewAuditEvent {
+    event
+        .with_detail("route", route)
+        .with_detail("org_id", repo.org_id())
+        .with_detail("repo_id", repo.repo_id())
+        .with_detail("workspace_id", workspace_id)
+}
+
 fn workspace_token_idempotency_scope(
     repo: &RequestTenantRepoContext,
     workspace_id: Uuid,
@@ -266,7 +281,8 @@ async fn revoke_workspace_token_after_failed_secret_replay(
 ) -> Result<(), VfsError> {
     let revoked = state
         .workspaces
-        .revoke_workspace_token_for_repo(
+        .revoke_workspace_token_for_org_repo(
+            repo.org_id(),
             repo.repo_id(),
             workspace_id,
             token_id,
@@ -285,6 +301,7 @@ async fn revoke_workspace_token_after_failed_secret_replay(
 async fn append_workspace_token_compensation_audit(
     state: &AppState,
     session: &Session,
+    repo: &RequestTenantRepoContext,
     workspace_id: Uuid,
     token_id: Uuid,
 ) -> bool {
@@ -295,6 +312,12 @@ async fn append_workspace_token_compensation_audit(
     )
     .with_detail("workspace_id", workspace_id)
     .with_detail("reason", "post_issue_failure");
+    let event = hosted_admin_audit_context(
+        event,
+        repo,
+        ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
+        workspace_id,
+    );
     state.audit.append(event).await.is_ok()
 }
 
@@ -357,6 +380,7 @@ async fn compensate_issued_workspace_token_failure(
                     append_workspace_token_compensation_audit(
                         state,
                         failure.session,
+                        failure.repo,
                         failure.workspace_id,
                         failure.token_id,
                     )
@@ -764,6 +788,12 @@ async fn create_workspace(
             if let Some(session_ref) = &workspace.session_ref {
                 event = event.with_detail("session_ref", session_ref);
             }
+            event = hosted_admin_audit_context(
+                event,
+                &repo,
+                CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
+                workspace.id,
+            );
             let body = serde_json::to_value(&workspace).expect("workspace record serializes");
             if let Err(e) = state.audit.append(event).await {
                 let (status, body) = audit_append_failed_after_mutation(e);
@@ -971,12 +1001,17 @@ async fn issue_workspace_token(
                     issued.token.id.to_string(),
                 ),
             )
-            .with_detail("workspace_id", id)
             .with_detail("token_name", &issued.token.name)
             .with_detail("agent_uid", issued.token.agent_uid)
             .with_detail("principal_uid", principal_uid)
             .with_detail("read_prefix_count", issued.token.read_prefixes.len())
             .with_detail("write_prefix_count", issued.token.write_prefixes.len());
+            let issue_audit = hosted_admin_audit_context(
+                issue_audit,
+                &repo,
+                ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
+                id,
+            );
             if let Err(error) = state.audit.append(issue_audit).await {
                 let (status, body) = audit_append_failed_after_mutation(error);
                 return compensate_issued_workspace_token_failure(
@@ -1158,8 +1193,8 @@ async fn revoke_workspace_token(
         AuditAction::WorkspaceTokenRevoke,
         AuditResource::id(AuditResourceKind::WorkspaceToken, token.id.to_string()),
     )
-    .with_detail("workspace_id", workspace_id)
     .with_detail("token_version", token.token_version);
+    event = hosted_admin_audit_context(event, &repo, REVOKE_WORKSPACE_TOKEN_ROUTE, workspace_id);
     if let Some(principal_uid) = token.principal_uid {
         event = event.with_detail("principal_uid", principal_uid);
     }
@@ -1897,6 +1932,118 @@ mod tests {
         assert_eq!(revoked_body["token_id"], token_id.to_string());
         assert_eq!(revoked_body["principal_uid"], agent_principal.uid);
         assert!(revoked_body["revoked_at_unix"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn durable_admin_workspace_mutation_audit_has_hosted_context() {
+        let org_id = OrgId::default_org();
+        let repo_id = RepoId::new("repo_durable_workspace_audit").unwrap();
+        let (state, workspaces, headers) = durable_workspace_state(org_id.clone(), repo_id.clone());
+        let agent_principal = WorkspacePrincipalRecord {
+            uid: 501,
+            username: "durable-agent".to_string(),
+            gid: 501,
+            groups: vec![501],
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+            org_id: Some(org_id.as_str().to_string()),
+        };
+        workspaces.insert_principal(&org_id, &repo_id, agent_principal.clone());
+
+        let created = create_workspace(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: Some("main".to_string()),
+                session_ref: Some("agent/demo/session".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        let workspace_id =
+            Uuid::parse_str(created_body["id"].as_str().expect("workspace id")).unwrap();
+
+        let issued = issue_workspace_token(
+            State(state.clone()),
+            headers.clone(),
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "demo-agent".to_string(),
+                agent_token: String::new(),
+                principal_uid: Some(agent_principal.uid),
+                read_prefixes: Some(vec!["/demo".to_string()]),
+                write_prefixes: Some(vec!["/demo/src".to_string()]),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let issued_body = response_json(issued).await;
+        let workspace_token = issued_body["workspace_token"]
+            .as_str()
+            .expect("workspace token response")
+            .to_string();
+        let token_id =
+            Uuid::parse_str(issued_body["token_id"].as_str().expect("token id")).unwrap();
+
+        let revoked = revoke_workspace_token(
+            State(state.clone()),
+            headers.clone(),
+            Path((workspace_id, token_id)),
+        )
+        .await
+        .into_response();
+        assert_eq!(revoked.status(), StatusCode::OK);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 3);
+        let workspace_id_text = workspace_id.to_string();
+        let expected = [
+            (
+                AuditAction::WorkspaceCreate,
+                CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
+            ),
+            (
+                AuditAction::WorkspaceTokenIssue,
+                ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
+            ),
+            (
+                AuditAction::WorkspaceTokenRevoke,
+                REVOKE_WORKSPACE_TOKEN_ROUTE,
+            ),
+        ];
+        for (event, (action, route)) in events.iter().zip(expected) {
+            assert_eq!(event.action, action);
+            assert_eq!(event.actor.uid, ROOT_UID);
+            assert_eq!(event.actor.username, "durable-admin");
+            assert_eq!(event.outcome, crate::audit::AuditOutcome::Success);
+            assert_eq!(
+                event.workspace.as_ref().map(|workspace| workspace.id),
+                Some(workspaces.admin_workspace.id)
+            );
+            assert_eq!(
+                event.details.get("org_id").map(String::as_str),
+                Some(org_id.as_str())
+            );
+            assert_eq!(
+                event.details.get("repo_id").map(String::as_str),
+                Some(repo_id.as_str())
+            );
+            assert_eq!(event.details.get("route").map(String::as_str), Some(route));
+            assert_eq!(
+                event.details.get("workspace_id").map(String::as_str),
+                Some(workspace_id_text.as_str())
+            );
+        }
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains(&workspaces.admin_raw_secret));
+        assert!(!audit_json.contains(&workspace_token));
+        assert!(!audit_json.contains("secret_hash"));
+        assert!(!audit_json.contains("redacted"));
     }
 
     #[tokio::test]
