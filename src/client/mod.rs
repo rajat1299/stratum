@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::backend::RepoId;
 use crate::error::VfsError;
+use crate::server::routes_capabilities::CapabilityManifest;
 
 #[derive(Clone)]
 pub enum ClientAuth {
@@ -87,6 +88,45 @@ pub struct ClientCommitLog {
     pub message: String,
     pub author: String,
     pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ClientCreatedWorkspace {
+    pub id: Uuid,
+    pub name: String,
+    pub root_path: String,
+    pub base_ref: String,
+    #[serde(default)]
+    pub session_ref: Option<String>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+pub struct ClientIssuedWorkspaceToken {
+    pub workspace_id: Uuid,
+    pub token_id: Uuid,
+    pub workspace_token: String,
+    pub name: String,
+}
+
+impl fmt::Debug for ClientIssuedWorkspaceToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientIssuedWorkspaceToken")
+            .field("workspace_id", &self.workspace_id)
+            .field("token_id", &self.token_id)
+            .field("workspace_token", &"<redacted>")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+struct CreateWorkspaceRequest<'a> {
+    name: &'a str,
+    root_path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_ref: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -171,6 +211,14 @@ impl StratumClient {
             .await
     }
 
+    pub async fn capabilities(&self) -> Result<CapabilityManifest, VfsError> {
+        self.json_without_auth(
+            self.client
+                .get(format!("{}/v1/capabilities", self.base_url)),
+        )
+        .await
+    }
+
     pub async fn list_directory(&self, path: &str) -> Result<ClientLsResponse, VfsError> {
         let path = path.trim_start_matches('/');
         let url = if path.is_empty() {
@@ -201,6 +249,17 @@ impl StratumClient {
         let url = format!("{}/fs/{}", self.base_url, path.trim_start_matches('/'));
         self.json(self.client.put(url).headers(self.headers()?).body(content))
             .await
+    }
+
+    pub async fn mkdir_p(&self, path: &str) -> Result<serde_json::Value, VfsError> {
+        let url = format!("{}/fs/{}", self.base_url, path.trim_start_matches('/'));
+        self.json(
+            self.client
+                .put(url)
+                .header("x-stratum-type", "directory")
+                .body(String::new()),
+        )
+        .await
     }
 
     pub async fn grep(
@@ -316,12 +375,28 @@ impl StratumClient {
         name: &str,
         root_path: &str,
     ) -> Result<serde_json::Value, VfsError> {
-        self.json(
-            self.client
-                .post(format!("{}/workspaces", self.base_url))
-                .headers(self.headers()?)
-                .json(&serde_json::json!({ "name": name, "root_path": root_path })),
-        )
+        self.create_workspace_response(CreateWorkspaceRequest {
+            name,
+            root_path,
+            base_ref: None,
+            session_ref: None,
+        })
+        .await
+    }
+
+    pub async fn create_workspace_with_refs(
+        &self,
+        name: &str,
+        root_path: &str,
+        base_ref: Option<&str>,
+        session_ref: Option<&str>,
+    ) -> Result<ClientCreatedWorkspace, VfsError> {
+        self.create_workspace_response(CreateWorkspaceRequest {
+            name,
+            root_path,
+            base_ref,
+            session_ref,
+        })
         .await
     }
 
@@ -343,19 +418,80 @@ impl StratumClient {
         read_prefixes: Option<Vec<String>>,
         write_prefixes: Option<Vec<String>>,
     ) -> Result<serde_json::Value, VfsError> {
+        self.issue_scoped_workspace_token_response(
+            workspace_id,
+            IssueWorkspaceTokenRequest {
+                name,
+                agent_token,
+                read_prefixes,
+                write_prefixes,
+            },
+        )
+        .await
+    }
+
+    pub async fn issue_scoped_workspace_token_parsed(
+        &self,
+        workspace_id: Uuid,
+        name: &str,
+        agent_token: &str,
+        read_prefixes: Option<Vec<String>>,
+        write_prefixes: Option<Vec<String>>,
+    ) -> Result<ClientIssuedWorkspaceToken, VfsError> {
+        self.issue_scoped_workspace_token_response(
+            workspace_id,
+            IssueWorkspaceTokenRequest {
+                name,
+                agent_token,
+                read_prefixes,
+                write_prefixes,
+            },
+        )
+        .await
+    }
+
+    pub async fn revoke_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        token_id: Uuid,
+    ) -> Result<serde_json::Value, VfsError> {
+        self.json(self.client.post(format!(
+            "{}/workspaces/{workspace_id}/tokens/{token_id}/revoke",
+            self.base_url
+        )))
+        .await
+    }
+
+    async fn create_workspace_response<T>(
+        &self,
+        request: CreateWorkspaceRequest<'_>,
+    ) -> Result<T, VfsError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        self.json(
+            self.client
+                .post(format!("{}/workspaces", self.base_url))
+                .json(&request),
+        )
+        .await
+    }
+
+    async fn issue_scoped_workspace_token_response<T>(
+        &self,
+        workspace_id: Uuid,
+        request: IssueWorkspaceTokenRequest<'_>,
+    ) -> Result<T, VfsError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
         self.json(
             self.client
                 .post(format!(
                     "{}/workspaces/{workspace_id}/tokens",
                     self.base_url
                 ))
-                .headers(self.headers()?)
-                .json(&IssueWorkspaceTokenRequest {
-                    name,
-                    agent_token,
-                    read_prefixes,
-                    write_prefixes,
-                }),
+                .json(&request),
         )
         .await
     }
@@ -369,6 +505,24 @@ impl StratumClient {
             .send()
             .await
             .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+        Self::json_response(response).await
+    }
+
+    async fn json_without_auth<T>(&self, builder: reqwest::RequestBuilder) -> Result<T, VfsError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+        Self::json_response(response).await
+    }
+
+    async fn json_response<T>(response: reqwest::Response) -> Result<T, VfsError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
         let status = response.status();
         let body = response
             .text()
@@ -601,6 +755,21 @@ mod tests {
     }
 
     #[test]
+    fn issued_workspace_token_debug_redacts_raw_secret() {
+        let issued = ClientIssuedWorkspaceToken {
+            workspace_id: Uuid::parse_str(WORKSPACE_ID).unwrap(),
+            token_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            workspace_token: "issued-workspace-secret".to_string(),
+            name: "incident-demo-agent".to_string(),
+        };
+
+        let rendered = format!("{issued:?}");
+
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("issued-workspace-secret"));
+    }
+
+    #[test]
     fn bearer_authorization_headers_are_marked_sensitive() {
         for auth in [
             ClientAuth::Bearer("raw-bearer-secret".to_string()),
@@ -690,6 +859,10 @@ mod tests {
         let (base_url, server, records) = spawn_header_echo_server().await;
         let client = workspace_repo_client(base_url);
 
+        let mkdir_err = client
+            .mkdir_p("/demo/workspace")
+            .await
+            .expect_err("server mkdir 501 should surface through the client");
         let write_err = client
             .write_file("/README.md", "updated".to_string())
             .await
@@ -704,7 +877,7 @@ mod tests {
             .expect_err("server revert 501 should surface through the client");
         server.abort();
 
-        for err in [write_err, commit_err, revert_err] {
+        for err in [mkdir_err, write_err, commit_err, revert_err] {
             let VfsError::InvalidArgs { message } = err else {
                 panic!("expected InvalidArgs for non-success response");
             };
@@ -716,7 +889,7 @@ mod tests {
             );
         }
         let values = recorded_headers(&records);
-        assert_eq!(values.len(), 3);
+        assert_eq!(values.len(), 4);
         for value in values {
             assert_workspace_repo_headers(&value);
         }
@@ -801,5 +974,107 @@ mod tests {
             request.get("write_prefixes"),
             Some(&serde_json::json!(["/demo/write"]))
         );
+    }
+
+    async fn spawn_workspace_lifecycle_server(
+        workspace_id: Uuid,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<usize>>) {
+        let token_issue_count = Arc::new(Mutex::new(0));
+        let token_issue_count_for_handler = token_issue_count.clone();
+        let app = Router::new()
+            .route(
+                "/workspaces",
+                post({
+                    move |Json(body): Json<serde_json::Value>| async move {
+                        Json(serde_json::json!({
+                            "id": workspace_id,
+                            "name": body.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            "root_path": body.get("root_path").and_then(Value::as_str).unwrap_or_default(),
+                            "base_ref": body.get("base_ref").and_then(Value::as_str).unwrap_or("main"),
+                            "session_ref": body.get("session_ref").and_then(Value::as_str),
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/workspaces/{workspace_id}/tokens",
+                post({
+                    move |Path(_): Path<Uuid>, Json(_body): Json<serde_json::Value>| {
+                        let token_issue_count = token_issue_count_for_handler.clone();
+                        async move {
+                            *token_issue_count.lock().unwrap() += 1;
+                            Json(serde_json::json!({
+                                "workspace_id": workspace_id,
+                                "token_id": "22222222-2222-2222-2222-222222222222",
+                                "workspace_token": "issued-workspace-secret",
+                                "name": "incident-demo-agent",
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/fs/{*path}",
+                axum::routing::put(|Path(_path): Path<String>, body: String| async move {
+                    (axum::http::StatusCode::OK, body)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), handle, token_issue_count)
+    }
+
+    #[tokio::test]
+    async fn create_workspace_with_refs_sends_optional_refs() {
+        let workspace_id = Uuid::new_v4();
+        let (base_url, server, _) = spawn_workspace_lifecycle_server(workspace_id).await;
+        let client = StratumClient::new(base_url, ClientAuth::Root);
+
+        let workspace = client
+            .create_workspace_with_refs(
+                "incident-demo",
+                "/demo/incident-workspace",
+                None,
+                Some("agent/incident-demo/session"),
+            )
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(workspace.id, workspace_id);
+        assert_eq!(workspace.name, "incident-demo");
+        assert_eq!(workspace.root_path, "/demo/incident-workspace");
+        assert_eq!(workspace.base_ref, "main");
+        assert_eq!(
+            workspace.session_ref.as_deref(),
+            Some("agent/incident-demo/session")
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_scoped_workspace_token_parsed_returns_typed_fields() {
+        let workspace_id = Uuid::new_v4();
+        let (base_url, server, issue_count) = spawn_workspace_lifecycle_server(workspace_id).await;
+        let client = StratumClient::new(base_url, ClientAuth::Root);
+
+        let issued = client
+            .issue_scoped_workspace_token_parsed(
+                workspace_id,
+                "incident-demo-agent",
+                "backing-agent-secret",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(issued.workspace_id, workspace_id);
+        assert_eq!(issued.name, "incident-demo-agent");
+        assert_eq!(issued.workspace_token, "issued-workspace-secret");
+        assert_eq!(*issue_count.lock().unwrap(), 1);
     }
 }

@@ -96,15 +96,17 @@ advertised as unavailable.
 
 The checked-in quick demo in `docs/agent-workspace-demo.md` proves the local
 workspace basics: initialize local state, create the admin user and agent, start
-`stratum-server`, seed files, search, write, commit, inspect history, and
-revert.
+`stratum-server`, run `stratumctl workspace seed-demo`, search, write, commit,
+inspect history, and revert.
 
 The private-beta golden path extends that local route surface with the existing
 change-request and audit routes: create a workspace, issue a scoped workspace
 token, edit files through that token, open a change request from the session
 ref to the target ref, inspect the diff, comment, approve or reject, merge when
-requirements pass, view audit events, and revert if needed. Packaging this as a
-single short demo script is still a close-out task.
+requirements pass, view audit events, and revert if needed. Local seeding is
+packaged as the local-state-only `stratumctl workspace seed-demo`, which writes
+the issued workspace token to a chmod-600 env file and prints safe next commands
+without leaking secrets.
 
 Hosted durable close-out remains narrower:
 

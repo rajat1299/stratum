@@ -10,6 +10,9 @@ use stratum::mount_daemon::{
 };
 use uuid::Uuid;
 
+#[path = "stratumctl/seed_demo.rs"]
+mod seed_demo;
+
 const DEFAULT_MOUNT_TAG: &str = "default";
 const DEFAULT_MOUNT_LOG_LINES: usize = 50;
 const MIN_MOUNT_LOG_LINES: usize = 1;
@@ -103,6 +106,22 @@ enum WorkspaceCommand {
         #[arg(long = "write-prefix")]
         write_prefixes: Vec<String>,
     },
+    SeedDemo {
+        #[arg(long, env = "STRATUM_AGENT_TOKEN")]
+        agent_token: Option<String>,
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        root_path: Option<String>,
+        #[arg(long)]
+        token_name: Option<String>,
+        #[arg(long)]
+        session_ref: Option<String>,
+        #[arg(long = "env-out")]
+        env_out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -158,7 +177,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let client = StratumClient::new(cli.url, auth).with_repo(cli.repo);
+    let client = StratumClient::new(cli.url.clone(), auth).with_repo(cli.repo.clone());
 
     let result = match cli.command {
         Command::Health => print_json(client.health().await),
@@ -252,7 +271,7 @@ async fn main() {
             }
             Err(err) => Err(err),
         },
-        Command::Workspace { command } => match command {
+        Command::Workspace { ref command } => match command {
             WorkspaceCommand::List => print_json(client.list_workspaces().await),
             WorkspaceCommand::Create { name, root_path } => {
                 print_json(client.create_workspace(&name, &root_path).await)
@@ -266,14 +285,52 @@ async fn main() {
             } => print_json(
                 client
                     .issue_scoped_workspace_token(
-                        workspace_id,
-                        &name,
-                        &agent_token,
-                        (!read_prefixes.is_empty()).then_some(read_prefixes),
-                        (!write_prefixes.is_empty()).then_some(write_prefixes),
+                        *workspace_id,
+                        name,
+                        agent_token,
+                        (!read_prefixes.is_empty()).then_some(read_prefixes.clone()),
+                        (!write_prefixes.is_empty()).then_some(write_prefixes.clone()),
                     )
                     .await,
             ),
+            WorkspaceCommand::SeedDemo {
+                agent_token,
+                fixture,
+                name,
+                root_path,
+                token_name,
+                session_ref,
+                env_out,
+            } => {
+                let auth = resolve_seed_demo_admin_auth(&cli);
+                match seed_demo::run_workspace_seed_demo(
+                    seed_demo::SeedDemoContext {
+                        url: cli.url.clone(),
+                        auth,
+                        repo: cli.repo.clone(),
+                        command_name: std::env::args()
+                            .next()
+                            .unwrap_or_else(|| "stratumctl".to_string()),
+                    },
+                    seed_demo::SeedDemoOptions {
+                        agent_token: agent_token.clone(),
+                        fixture: fixture.clone(),
+                        name: name.clone(),
+                        root_path: root_path.clone(),
+                        token_name: token_name.clone(),
+                        session_ref: session_ref.clone(),
+                        env_out: env_out.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok(output) => {
+                        print!("{output}");
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
         },
         Command::Mount { .. } => unreachable!("mount commands are handled before auth resolution"),
     };
@@ -624,6 +681,16 @@ fn resolve_auth(cli: &Cli) -> Result<ClientAuth, VfsError> {
     Ok(ClientAuth::Root)
 }
 
+fn resolve_seed_demo_admin_auth(cli: &Cli) -> ClientAuth {
+    if let Some(token) = cli.token.clone() {
+        return ClientAuth::Bearer(token);
+    }
+    if let Some(user) = cli.user.clone() {
+        return ClientAuth::User(user);
+    }
+    ClientAuth::Root
+}
+
 async fn read_stdin() -> String {
     use tokio::io::AsyncReadExt;
 
@@ -817,6 +884,30 @@ mod tests {
     }
 
     #[test]
+    fn seed_demo_admin_auth_ignores_stale_workspace_auth() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+        let workspace_id = Uuid::new_v4();
+        let cli = Cli::try_parse_from([
+            "stratumctl",
+            "--workspace-id",
+            &workspace_id.to_string(),
+            "--workspace-token",
+            "stale-workspace-secret",
+            "--user",
+            "root",
+            "workspace",
+            "seed-demo",
+            "--agent-token",
+            "backing-agent-secret",
+        ])
+        .unwrap();
+
+        let auth = resolve_seed_demo_admin_auth(&cli);
+
+        assert!(matches!(auth, ClientAuth::User(username) if username == "root"));
+    }
+
+    #[test]
     fn invalid_workspace_id_is_rejected_without_leaking_raw_value() {
         let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
         let cli = Cli::try_parse_from([
@@ -878,6 +969,139 @@ mod tests {
         assert_eq!(agent_token, "agent-secret");
         assert_eq!(read_prefixes, vec!["/demo/read", "/demo/shared"]);
         assert_eq!(write_prefixes, vec!["/demo/write"]);
+    }
+
+    #[test]
+    fn workspace_seed_demo_parses_defaults() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+        let cli = Cli::try_parse_from([
+            "stratumctl",
+            "workspace",
+            "seed-demo",
+            "--agent-token",
+            "backing-agent-secret",
+        ])
+        .unwrap();
+
+        let Command::Workspace {
+            command:
+                WorkspaceCommand::SeedDemo {
+                    agent_token,
+                    fixture,
+                    name,
+                    root_path,
+                    token_name,
+                    session_ref,
+                    env_out,
+                },
+        } = cli.command
+        else {
+            panic!("expected workspace seed-demo command");
+        };
+
+        assert_eq!(agent_token.as_deref(), Some("backing-agent-secret"));
+        assert_eq!(fixture, None);
+        assert_eq!(name, None);
+        assert_eq!(root_path, None);
+        assert_eq!(token_name, None);
+        assert_eq!(session_ref, None);
+        assert_eq!(env_out, None);
+    }
+
+    #[test]
+    fn workspace_seed_demo_parses_custom_flags() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+        let cli = Cli::try_parse_from([
+            "stratumctl",
+            "workspace",
+            "seed-demo",
+            "--agent-token",
+            "backing-agent-secret",
+            "--fixture",
+            "custom/fixture",
+            "--name",
+            "custom-demo",
+            "--root-path",
+            "/demo/custom",
+            "--token-name",
+            "custom-agent",
+            "--session-ref",
+            "agent/custom/session",
+            "--env-out",
+            ".stratum-demo/custom.env",
+        ])
+        .unwrap();
+
+        let Command::Workspace {
+            command:
+                WorkspaceCommand::SeedDemo {
+                    agent_token,
+                    fixture,
+                    name,
+                    root_path,
+                    token_name,
+                    session_ref,
+                    env_out,
+                },
+        } = cli.command
+        else {
+            panic!("expected workspace seed-demo command");
+        };
+
+        assert_eq!(agent_token.as_deref(), Some("backing-agent-secret"));
+        assert_eq!(fixture, Some(PathBuf::from("custom/fixture")));
+        assert_eq!(name.as_deref(), Some("custom-demo"));
+        assert_eq!(root_path.as_deref(), Some("/demo/custom"));
+        assert_eq!(token_name.as_deref(), Some("custom-agent"));
+        assert_eq!(session_ref.as_deref(), Some("agent/custom/session"));
+        assert_eq!(env_out, Some(PathBuf::from(".stratum-demo/custom.env")));
+    }
+
+    struct AgentTokenEnvGuard {
+        previous: Option<OsString>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl AgentTokenEnvGuard {
+        fn set(value: &str) -> Self {
+            let guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+            let previous = std::env::var_os("STRATUM_AGENT_TOKEN");
+            unsafe {
+                std::env::set_var("STRATUM_AGENT_TOKEN", value);
+            }
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for AgentTokenEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe {
+                    std::env::set_var("STRATUM_AGENT_TOKEN", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("STRATUM_AGENT_TOKEN");
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_seed_demo_agent_token_env_parses() {
+        let _agent_env = AgentTokenEnvGuard::set("env-backing-agent-secret");
+        let cli = Cli::try_parse_from(["stratumctl", "workspace", "seed-demo"]).unwrap();
+
+        let Command::Workspace {
+            command: WorkspaceCommand::SeedDemo { agent_token, .. },
+        } = cli.command
+        else {
+            panic!("expected workspace seed-demo command");
+        };
+
+        assert_eq!(agent_token.as_deref(), Some("env-backing-agent-secret"));
     }
 
     #[test]

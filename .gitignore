@@ -19,6 +19,10 @@
 # Claude Code per-project config
 /.claude/
 
+# Local demo output
+/.demo/
+/.stratum-demo/
+
 # Live gates / secrets (never commit)
 /.env.live-gates
 

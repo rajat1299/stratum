@@ -6,7 +6,7 @@ The current demo uses:
 
 - the `stratum` CLI for one-time setup
 - the `stratum-server` HTTP API as the single writer
-- normal shell commands like `curl` and `jq` so the agent can work through familiar CLI tools
+- `stratumctl workspace seed-demo` plus `stratumctl` after `source` for agent-facing commands
 
 ## Demo Goal
 
@@ -25,7 +25,7 @@ Show that agents need more than raw filesystem access. They need a persistent wo
 
 ```bash
 export STRATUM_DATA_DIR="$PWD/.demo/incident-workspace"
-rm -rf "$STRATUM_DATA_DIR"
+rm -rf "$STRATUM_DATA_DIR" .stratum-demo
 mkdir -p "$STRATUM_DATA_DIR"
 ```
 
@@ -43,14 +43,10 @@ Create an admin user when prompted:
 Admin username: alice
 ```
 
-Then set up shared top-level directories and an agent token:
+Then create the backing agent token:
 
 ```text
 alice@stratum:~ $ su root
-root@stratum:~ $ mkdir -p /incidents/checkout-latency
-root@stratum:~ $ mkdir -p /runbooks
-root@stratum:~ $ mkdir -p /memory/agents
-root@stratum:~ $ chmod 777 /incidents /incidents/checkout-latency /runbooks /memory /memory/agents
 root@stratum:~ $ addagent incident-bot
 Created agent: incident-bot (uid=2)
 Token: REPLACE_WITH_REAL_TOKEN
@@ -60,7 +56,7 @@ root@stratum:~ $ exit
 Save the token in another terminal:
 
 ```bash
-export STRATUM_TOKEN="REPLACE_WITH_REAL_TOKEN"
+export STRATUM_AGENT_TOKEN="REPLACE_WITH_REAL_TOKEN"
 ```
 
 Exit the CLI before starting the HTTP server.
@@ -73,49 +69,32 @@ STRATUM_LISTEN=127.0.0.1:3000 \
 cargo run --release --bin stratum-server
 ```
 
-### 4. Seed the workspace from the example files
+### 4. Seed the workspace with `stratumctl`
 
-In another terminal:
-
-```bash
-curl -s -X PUT http://localhost:3000/fs/incidents/checkout-latency/timeline.md \
-  -H "Authorization: User alice" \
-  --data-binary @examples/incident-workspace/incidents/checkout-latency/timeline.md
-
-curl -s -X PUT http://localhost:3000/fs/incidents/checkout-latency/evidence.md \
-  -H "Authorization: User alice" \
-  --data-binary @examples/incident-workspace/incidents/checkout-latency/evidence.md
-
-curl -s -X PUT http://localhost:3000/fs/incidents/checkout-latency/hypotheses.md \
-  -H "Authorization: User alice" \
-  --data-binary @examples/incident-workspace/incidents/checkout-latency/hypotheses.md
-
-curl -s -X PUT http://localhost:3000/fs/runbooks/payment-service.md \
-  -H "Authorization: User alice" \
-  --data-binary @examples/incident-workspace/runbooks/payment-service.md
-
-curl -s -X PUT http://localhost:3000/fs/memory/agents/researcher.md \
-  -H "Authorization: User alice" \
-  --data-binary @examples/incident-workspace/memory/agents/researcher.md
-```
-
-Create a baseline commit:
+In another terminal, with the server running and the backing agent token from
+`addagent` exported:
 
 ```bash
-curl -s -X POST http://localhost:3000/vcs/commit \
-  -H "Authorization: User root" \
-  -H "Content-Type: application/json" \
-  -d '{"message":"seed incident workspace"}' | jq
+export STRATUM_AGENT_TOKEN="<existing-agent-token>"
+
+cargo run --release --bin stratumctl -- \
+  --url http://127.0.0.1:3000 \
+  --user root \
+  workspace seed-demo
 ```
 
-Expected shape:
+This local-state-only command creates the `incident-demo` workspace at
+`/demo/incident-workspace`, creates the workspace root, seeds the files from
+`examples/incident-workspace`, issues a scoped workspace token, and writes it to
+`.stratum-demo/incident-workspace.env` with `chmod 600`. The command prints safe
+next steps only; no raw tokens are printed.
 
-```json
-{
-  "hash": "abcd1234",
-  "message": "seed incident workspace",
-  "author": "alice"
-}
+Load the env file and inspect the workspace:
+
+```bash
+source .stratum-demo/incident-workspace.env
+stratumctl tree /
+stratumctl grep timeout /
 ```
 
 ## 7-Minute Script
@@ -132,43 +111,31 @@ Show health:
 curl -s http://localhost:3000/health | jq
 ```
 
-Expected shape:
-
-```json
-{
-  "status": "ok",
-  "version": "1.0.0",
-  "commits": 1
-}
-```
+Expected: `status` is `ok`, `commits` is `0` before the first demo commit,
+and `inodes` is nonzero after seeding.
 
 ### Minute 1-2: Show workspace state through CLI tools
 
 List the incident folder as the agent:
 
 ```bash
-curl -s http://localhost:3000/fs/incidents/checkout-latency/ \
-  -H "Authorization: Bearer $STRATUM_TOKEN" | jq
+source .stratum-demo/incident-workspace.env
+stratumctl ls /incidents/checkout-latency/
 ```
 
 Expected entries:
 
-```json
-{
-  "path": "/incidents/checkout-latency",
-  "entries": [
-    {"name": "evidence.md", "kind": "file"},
-    {"name": "hypotheses.md", "kind": "file"},
-    {"name": "timeline.md", "kind": "file"}
-  ]
-}
+```text
+evidence.md
+hypotheses.md
+timeline.md
 ```
 
 Show the whole tree:
 
 ```bash
-curl -s http://localhost:3000/tree \
-  -H "Authorization: Bearer $STRATUM_TOKEN"
+source .stratum-demo/incident-workspace.env
+stratumctl tree /
 ```
 
 ### Minute 2-3: Let the agent inspect evidence before writing
@@ -176,44 +143,42 @@ curl -s http://localhost:3000/tree \
 Read the runbook:
 
 ```bash
-curl -s http://localhost:3000/fs/runbooks/payment-service.md \
-  -H "Authorization: Bearer $STRATUM_TOKEN"
+source .stratum-demo/incident-workspace.env
+stratumctl cat /runbooks/payment-service.md
 ```
 
 Search for prior timeout and retry signals:
 
 ```bash
-curl -s "http://localhost:3000/search/grep?pattern=timeout|retry&recursive=true" \
-  -H "Authorization: Bearer $STRATUM_TOKEN" | jq
+source .stratum-demo/incident-workspace.env
+stratumctl grep "timeout|retry" /
 ```
 
-Expected result shape:
+Expected stdout:
 
-```json
-{
-  "results": [
-    {
-      "file": "runbooks/payment-service.md",
-      "line_num": 7,
-      "line": "If checkout latency spikes immediately after a payment-service deploy, inspect timeout and retry changes first."
-    }
-  ],
-  "count": 1
-}
+```text
+incidents/checkout-latency/evidence.md:6: - `payment_service_timeout_rate`: 7.4%, baseline < 0.5%
+incidents/checkout-latency/evidence.md:7: - `checkout_retry_rate`: 3.1x baseline
+incidents/checkout-latency/evidence.md:13: ERROR payment confirmation request exceeded timeout budget
+incidents/checkout-latency/hypotheses.md:5: ### 1. Payment-service timeout regression
+incidents/checkout-latency/hypotheses.md:7: Latest rollout likely changed timeout handling or retry behavior, causing checkout to block on confirmation.
+...
+runbooks/payment-service.md:9: If checkout latency spikes immediately after a payment-service deploy, inspect timeout and retry changes first.
 ```
+
+`stratumctl grep` writes the match count to stderr.
 
 Narration:
 
-> The agent is using plain CLI tools against the workspace. Today that means `curl` and `jq`; later this becomes the `stratumctl` CLI wrapper.
+> The agent is using `stratumctl` against the workspace after sourcing the secure env file.
 
 ### Minute 3-4: Create new agent output
 
 Write a root-cause summary:
 
 ```bash
-cat <<'EOF' | curl -s -X PUT http://localhost:3000/fs/incidents/checkout-latency/root-cause.md \
-  -H "Authorization: Bearer $STRATUM_TOKEN" \
-  --data-binary @-
+source .stratum-demo/incident-workspace.env
+cat <<'EOF' | stratumctl write /incidents/checkout-latency/root-cause.md --stdin
 # Root Cause
 
 The most likely root cause is a payment-service timeout and retry regression introduced by the latest deploy.
@@ -247,9 +212,8 @@ curl -s http://localhost:3000/vcs/log \
 Make a bad edit:
 
 ```bash
-cat <<'EOF' | curl -s -X PUT http://localhost:3000/fs/incidents/checkout-latency/root-cause.md \
-  -H "Authorization: Bearer $STRATUM_TOKEN" \
-  --data-binary @-
+source .stratum-demo/incident-workspace.env
+cat <<'EOF' | stratumctl write /incidents/checkout-latency/root-cause.md --stdin
 # Root Cause
 
 Everything looks healthy. No action required.
@@ -284,15 +248,15 @@ curl -s -X POST http://localhost:3000/vcs/revert \
 Confirm the restored file:
 
 ```bash
-curl -s http://localhost:3000/fs/incidents/checkout-latency/root-cause.md \
-  -H "Authorization: Bearer $STRATUM_TOKEN"
+source .stratum-demo/incident-workspace.env
+stratumctl cat /incidents/checkout-latency/root-cause.md
 ```
 
 ### Minute 5-6: Show permissioned agent access
 
 Point out that the workspace is not just shared storage. It has identity and access.
 
-Use the restricted bearer-token agent for all reads/writes in the demo. Then show what a named human user sees:
+Use the scoped workspace token from `.stratum-demo/incident-workspace.env` for all agent reads and writes in the demo. Then show what a named human user sees:
 
 ```bash
 curl -s http://localhost:3000/auth/login \
@@ -322,4 +286,4 @@ These are good live prompts while the shell commands are visible:
 
 - Use the HTTP server as the single writer during the live demo.
 - Do not run the CLI, MCP server, and HTTP server as concurrent writers against the same `state.bin`.
-- If you want a future-looking slide, describe `stratumctl ls`, `stratumctl search`, and `stratumctl run` as the next CLI surface, but keep the live commands grounded in what exists now.
+- Keep the live commands grounded in the existing `stratumctl ls`, `cat`, `tree`, `grep`, and `write` surface.
