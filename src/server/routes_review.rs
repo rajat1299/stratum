@@ -3499,6 +3499,20 @@ mod tests {
                 .expect("merge approval completes");
             assert_eq!(approved_merge.status(), reqwest::StatusCode::CREATED);
 
+            let viewed = client
+                .put(format!(
+                    "{base_url}/change-requests/{merge_change_id}/viewed-files"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "path": "/legal.txt",
+                    "viewed": true,
+                }))
+                .send()
+                .await
+                .expect("viewed file update completes");
+            assert_eq!(viewed.status(), reqwest::StatusCode::OK);
+
             let merged = client
                 .post(format!(
                     "{base_url}/change-requests/{merge_change_id}/merge"
@@ -4186,6 +4200,51 @@ mod tests {
             .await
             .unwrap();
         (state, base, head, change.id)
+    }
+
+    async fn mark_change_request_file_viewed(
+        state: &AppState,
+        headers: HeaderMap,
+        change_id: Uuid,
+        path: &str,
+    ) {
+        let response = set_change_request_viewed_file(
+            State(state.clone()),
+            headers,
+            AxumPath(change_id),
+            Json(SetViewedFileRequest {
+                path: path.to_string(),
+                viewed: true,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn mark_review_fixture_files_viewed(state: &AppState, change_id: Uuid, username: &str) {
+        mark_change_request_file_viewed(
+            state,
+            user_headers(username),
+            change_id,
+            "/legal.txt",
+        )
+        .await;
+    }
+
+    async fn mark_review_fixture_files_viewed_for_repo(
+        state: &AppState,
+        change_id: Uuid,
+        username: &str,
+        repo_id: &RepoId,
+    ) {
+        mark_change_request_file_viewed(
+            state,
+            user_headers_for_repo(username, repo_id),
+            change_id,
+            "/legal.txt",
+        )
+        .await;
     }
 
     fn assert_review_mutation_audit_context(
@@ -6199,6 +6258,8 @@ mod tests {
         );
         assert_eq!(alice_approval["approval_state"]["approved"], true);
 
+        mark_review_fixture_files_viewed(&state, id, "root").await;
+
         let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
             .await
             .into_response();
@@ -6775,6 +6836,7 @@ mod tests {
         .await
         .into_response();
         assert_eq!(approval.status(), StatusCode::CREATED);
+        mark_review_fixture_files_viewed(&state, id, "root").await;
         let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
             .await
             .into_response();
@@ -6842,6 +6904,8 @@ mod tests {
         .into_response();
         assert_eq!(approval.status(), StatusCode::CREATED);
 
+        mark_review_fixture_files_viewed(&state, id, "root").await;
+
         let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
             .await
             .into_response();
@@ -6850,11 +6914,12 @@ mod tests {
         assert_eq!(merged_body["approval_state"]["approved"], true);
         assert_eq!(merged_body["target_ref"]["target"], head);
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert_eq!(events[0].action, AuditAction::PolicyDecisionDeny);
         assert_eq!(events[1].action, AuditAction::ChangeRequestApprove);
-        assert_eq!(events[2].action, AuditAction::PolicyDecisionAllow);
-        assert_eq!(events[3].action, AuditAction::ChangeRequestMerge);
+        assert_eq!(events[2].action, AuditAction::ChangeRequestFileView);
+        assert_eq!(events[3].action, AuditAction::PolicyDecisionAllow);
+        assert_eq!(events[4].action, AuditAction::ChangeRequestMerge);
     }
 
     #[tokio::test]
@@ -6890,6 +6955,8 @@ mod tests {
         .await
         .into_response();
         assert_eq!(approval.status(), StatusCode::CREATED);
+
+        mark_review_fixture_files_viewed(&state, id, "root").await;
 
         let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
             .await
@@ -6971,6 +7038,8 @@ mod tests {
         .await
         .into_response();
         assert_eq!(approval.status(), StatusCode::CREATED);
+
+        mark_review_fixture_files_viewed_for_repo(&state, id, "root", &repo_id).await;
 
         let merged = merge_change_request(
             State(state.clone()),
