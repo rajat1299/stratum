@@ -145,7 +145,8 @@ impl AuditExportClass {
             AuditAction::ChangeRequestCreate
             | AuditAction::ChangeRequestApprove
             | AuditAction::ChangeRequestApprovalDismiss
-            | AuditAction::ChangeRequestCommentCreate
+            |             AuditAction::ChangeRequestCommentCreate
+            | AuditAction::ChangeRequestFileView
             | AuditAction::ChangeRequestReviewerAssign
             | AuditAction::ChangeRequestReject
             | AuditAction::ChangeRequestMerge => Self::ChangeRequest,
@@ -675,6 +676,7 @@ pub enum AuditAction {
     ChangeRequestApprove,
     ChangeRequestApprovalDismiss,
     ChangeRequestCommentCreate,
+    ChangeRequestFileView,
     ChangeRequestReviewerAssign,
     ChangeRequestReject,
     ChangeRequestMerge,

@@ -27,7 +27,8 @@ use crate::idempotency::{
 use crate::review::{
     ApprovalPolicyDecision, ApprovalRecord, ChangeRequest, ChangeRequestStatus,
     DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewAssignment,
-    NewReviewComment, ReviewAssignment, ReviewComment, ReviewCommentKind,
+    NewReviewComment, ReviewAssignment, ReviewComment, ReviewCommentKind, SetViewedFileInput,
+    ViewedFileRecord,
 };
 use crate::vcs::RefName;
 
@@ -37,6 +38,7 @@ const CREATE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests";
 const CREATE_CHANGE_REQUEST_APPROVAL_ROUTE: &str = "POST /change-requests/{id}/approvals";
 const ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE: &str = "POST /change-requests/{id}/reviewers";
 const CREATE_CHANGE_REQUEST_COMMENT_ROUTE: &str = "POST /change-requests/{id}/comments";
+const SET_CHANGE_REQUEST_VIEWED_FILE_ROUTE: &str = "PUT /change-requests/{id}/viewed-files";
 const DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE: &str =
     "POST /change-requests/{id}/approvals/{approval_id}/dismiss";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
@@ -83,6 +85,12 @@ struct CreateReviewCommentRequest {
     body: String,
     path: Option<String>,
     kind: Option<ReviewCommentKind>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SetViewedFileRequest {
+    path: String,
+    viewed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +143,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/change-requests/{id}/comments",
             get(list_change_request_comments).post(create_change_request_comment),
+        )
+        .route(
+            "/change-requests/{id}/viewed-files",
+            get(list_change_request_viewed_files).put(set_change_request_viewed_file),
         )
         .route(
             "/change-requests/{id}/approvals/{approval_id}/dismiss",
@@ -666,6 +678,43 @@ async fn approval_dismissal_json(
         "approval_state": summary.approval_state,
         "require_all_files_viewed": summary.require_all_files_viewed,
     })
+}
+
+async fn viewed_files_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    viewed_by: Uid,
+) -> Result<serde_json::Value, VfsError> {
+    let changed_paths = changed_paths_for_change(state, change).await?;
+    let approval_state = approval_decision_for_paths(state, change, &changed_paths).await?;
+    let viewed_records = state
+        .review
+        .list_viewed_files_for_repo(&change.repo_id, change.id, viewed_by)
+        .await?;
+    let mut required_paths = changed_paths;
+    required_paths.sort();
+    let viewed_true_paths = viewed_records
+        .iter()
+        .filter(|record| record.head_commit == change.head_commit && record.viewed)
+        .map(|record| record.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let unviewed_paths = required_paths
+        .iter()
+        .filter(|path| !viewed_true_paths.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_head_records = viewed_records
+        .into_iter()
+        .filter(|record| record.head_commit == change.head_commit)
+        .collect::<Vec<ViewedFileRecord>>();
+    Ok(serde_json::json!({
+        "viewed_files": current_head_records,
+        "required_paths": required_paths,
+        "unviewed_paths": unviewed_paths,
+        "all_required_files_viewed": unviewed_paths.is_empty(),
+        "require_all_files_viewed": approval_state.require_all_files_viewed,
+        "approval_state": approval_state_value(&approval_state),
+    }))
 }
 
 fn mutation_committed_failure_body(
@@ -1822,6 +1871,188 @@ async fn assign_change_request_reviewer(
     }
 }
 
+async fn list_change_request_viewed_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
+        Ok(change) => change,
+        Err(response) => return response,
+    };
+
+    match viewed_files_json(&state, &change, session.uid).await {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(e) => err_json(error_status(&e, StatusCode::CONFLICT), e.to_string()).into_response(),
+    }
+}
+
+async fn set_change_request_viewed_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SetViewedFileRequest>,
+) -> impl IntoResponse {
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+
+    let reservation = match begin_review_idempotency(
+        &state,
+        &session,
+        &headers,
+        SET_CHANGE_REQUEST_VIEWED_FILE_ROUTE,
+        &repo,
+        serde_json::json!({
+            "route": SET_CHANGE_REQUEST_VIEWED_FILE_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
+            "change_request_id": id,
+            "path": &req.path,
+            "viewed": req.viewed,
+        }),
+    )
+    .await
+    {
+        ReviewIdempotency::Execute(reservation) => reservation,
+        ReviewIdempotency::Respond(response) => return response,
+    };
+
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
+        Ok(change) => change,
+        Err(response) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return response;
+        }
+    };
+
+    let changed_paths = match changed_paths_for_change(&state, &change).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return err_json(StatusCode::CONFLICT, e.to_string()).into_response();
+        }
+    };
+    let path = req.path.trim().to_string();
+    if path.is_empty() || path == "/" || !path.starts_with('/') {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("invalid path {path}"),
+        )
+        .into_response();
+    }
+    if !changed_paths.iter().any(|changed| changed == &path) {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("path {path} is not in the current changed paths for change request {id}"),
+        )
+        .into_response();
+    }
+
+    match state
+        .review
+        .set_viewed_file_for_repo(
+            repo.repo_id(),
+            SetViewedFileInput {
+                change_request_id: id,
+                path,
+                viewed_by: session.uid,
+                viewed: req.viewed,
+            },
+        )
+        .await
+    {
+        Ok(mutation) => {
+            let mut body = match viewed_files_json(&state, &change, session.uid).await {
+                Ok(body) => body,
+                Err(e) => {
+                    abort_review_idempotency(&state, reservation.as_ref()).await;
+                    return err_json(error_status(&e, StatusCode::CONFLICT), e.to_string())
+                        .into_response();
+                }
+            };
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "viewed_file".to_string(),
+                    serde_json::to_value(&mutation.record)
+                        .expect("viewed file record serializes"),
+                );
+                object.insert(
+                    "updated".to_string(),
+                    serde_json::Value::Bool(mutation.created || mutation.updated),
+                );
+            }
+            if mutation.created || mutation.updated {
+                let event = review_mutation_audit_event(
+                    &session,
+                    AuditAction::ChangeRequestFileView,
+                    AuditResource::id(
+                        AuditResourceKind::ChangeRequest,
+                        change.id.to_string(),
+                    ),
+                    SET_CHANGE_REQUEST_VIEWED_FILE_ROUTE,
+                    &change,
+                    reservation.as_ref(),
+                )
+                .with_detail("path", &mutation.record.path)
+                .with_detail("viewed", mutation.record.viewed)
+                .with_detail("viewed_by", mutation.record.viewed_by)
+                .with_detail("head_commit", &mutation.record.head_commit)
+                .with_detail("version", mutation.record.version);
+                if let Err(e) = state.audit.append(event).await {
+                    let (status, body) = audit_append_failed_body(e);
+                    if let Err(response) =
+                        complete_review_idempotency(&state, reservation.as_ref(), status, &body)
+                            .await
+                    {
+                        return response;
+                    }
+                    return json_response(status, body);
+                }
+            }
+            if let Err(response) =
+                complete_review_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body)
+                    .await
+            {
+                return response;
+            }
+            json_response(StatusCode::OK, body)
+        }
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
+    }
+}
+
 async fn validate_reviewer_can_approve(
     state: &AppState,
     actor_session: &Session,
@@ -2431,6 +2662,51 @@ async fn merge_change_request(
     if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
         abort_review_idempotency(&state, reservation.as_ref()).await;
         return response;
+    }
+    if approval_state.require_all_files_viewed {
+        let viewed_records = match state
+            .review
+            .list_viewed_files_for_repo(repo.repo_id(), id, session.uid)
+            .await
+        {
+            Ok(records) => records,
+            Err(e) => {
+                abort_review_idempotency(&state, reservation.as_ref()).await;
+                return err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response();
+            }
+        };
+        let viewed_true_paths = viewed_records
+            .iter()
+            .filter(|record| record.head_commit == change.head_commit && record.viewed)
+            .map(|record| record.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut required_paths = changed_paths.clone();
+        required_paths.sort();
+        let unviewed_paths = required_paths
+            .iter()
+            .filter(|path| !viewed_true_paths.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unviewed_paths.is_empty() {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return json_response(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({
+                    "error": format!(
+                        "change request {id} requires all changed files to be viewed before merge"
+                    ),
+                    "required_paths": required_paths,
+                    "unviewed_paths": unviewed_paths,
+                    "all_required_files_viewed": false,
+                    "require_all_files_viewed": true,
+                    "approval_state": approval_state_value(&approval_state),
+                }),
+            );
+        }
     }
     let review_policy_token =
         match PolicyDecisionToken::from_review_approved_evaluation(&policy_evaluation) {
@@ -7302,5 +7578,342 @@ mod tests {
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains("reject-cr-replay"));
         assert!(!audit_json.contains("metadata only"));
+    }
+
+    mod viewed_files {
+        use super::*;
+
+        async fn require_file_view_policy(state: &AppState) {
+            state
+                .review
+                .create_protected_path_rule_for_repo(
+                    &RepoId::local(),
+                    "/legal.txt",
+                    Some("main"),
+                    1,
+                    ROOT_UID,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn list_change_request_viewed_files_reports_required_and_unviewed_paths() {
+            let (state, _base, _head, id) = review_fixture().await;
+            require_file_view_policy(&state).await;
+
+            let response = list_change_request_viewed_files(
+                State(state.clone()),
+                user_headers("root"),
+                AxumPath(id),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["required_paths"], serde_json::json!(["/legal.txt"]));
+            assert_eq!(body["unviewed_paths"], serde_json::json!(["/legal.txt"]));
+            assert_eq!(body["all_required_files_viewed"], false);
+            assert_eq!(body["require_all_files_viewed"], true);
+            assert_eq!(body["viewed_files"].as_array().unwrap().len(), 0);
+            assert_eq!(body["approval_state"]["approved"], false);
+            assert_eq!(body["approval_state"]["required_approvals"], 1);
+        }
+
+        #[tokio::test]
+        async fn set_change_request_viewed_file_marks_and_unmarks_path() {
+            let (state, base, head, id) = review_fixture().await;
+            require_file_view_policy(&state).await;
+
+            let marked = set_change_request_viewed_file(
+                State(state.clone()),
+                user_headers("root"),
+                AxumPath(id),
+                Json(SetViewedFileRequest {
+                    path: "/legal.txt".to_string(),
+                    viewed: true,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(marked.status(), StatusCode::OK);
+            let marked_body = response_json(marked).await;
+            assert_eq!(marked_body["updated"], true);
+            assert_eq!(marked_body["viewed_file"]["path"], "/legal.txt");
+            assert_eq!(marked_body["viewed_file"]["viewed"], true);
+            assert_eq!(marked_body["viewed_file"]["viewed_by"], ROOT_UID);
+            assert_eq!(marked_body["viewed_file"]["head_commit"], head);
+            assert_eq!(marked_body["unviewed_paths"], serde_json::json!([]));
+            assert_eq!(marked_body["all_required_files_viewed"], true);
+
+            let events = state.audit.list_recent(10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].action, AuditAction::ChangeRequestFileView);
+            assert_review_mutation_audit_context(
+                &events[0],
+                SET_CHANGE_REQUEST_VIEWED_FILE_ROUTE,
+                id,
+                &base,
+                &head,
+                false,
+            );
+            assert_eq!(
+                events[0].details.get("path").map(String::as_str),
+                Some("/legal.txt")
+            );
+            assert_eq!(
+                events[0].details.get("viewed").map(String::as_str),
+                Some("true")
+            );
+
+            let unmarked = set_change_request_viewed_file(
+                State(state.clone()),
+                user_headers("root"),
+                AxumPath(id),
+                Json(SetViewedFileRequest {
+                    path: "/legal.txt".to_string(),
+                    viewed: false,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(unmarked.status(), StatusCode::OK);
+            let unmarked_body = response_json(unmarked).await;
+            assert_eq!(unmarked_body["updated"], true);
+            assert_eq!(unmarked_body["viewed_file"]["viewed"], false);
+            assert_eq!(
+                unmarked_body["unviewed_paths"],
+                serde_json::json!(["/legal.txt"])
+            );
+            assert_eq!(unmarked_body["all_required_files_viewed"], false);
+        }
+
+        #[tokio::test]
+        async fn set_change_request_viewed_file_rejects_path_outside_changed_paths() {
+            let (state, _base, _head, id) = review_fixture().await;
+
+            let response = set_change_request_viewed_file(
+                State(state.clone()),
+                user_headers("root"),
+                AxumPath(id),
+                Json(SetViewedFileRequest {
+                    path: "/other.md".to_string(),
+                    viewed: true,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn set_change_request_viewed_file_replays_idempotently() {
+            let (state, _base, _head, id) = review_fixture().await;
+            let headers = user_headers_with_idempotency("root", "viewed-file-replay");
+            let request = || SetViewedFileRequest {
+                path: "/legal.txt".to_string(),
+                viewed: true,
+            };
+
+            let first = set_change_request_viewed_file(
+                State(state.clone()),
+                headers.clone(),
+                AxumPath(id),
+                Json(request()),
+            )
+            .await
+            .into_response();
+            assert_eq!(first.status(), StatusCode::OK);
+            let first_body = response_json(first).await;
+
+            let replay = set_change_request_viewed_file(
+                State(state.clone()),
+                headers,
+                AxumPath(id),
+                Json(request()),
+            )
+            .await
+            .into_response();
+            assert_eq!(replay.status(), StatusCode::OK);
+            assert_eq!(
+                replay
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+            assert_eq!(
+                response_json(replay).await,
+                sanitized_review_idempotency_body(&first_body)
+            );
+
+            let events = state.audit.list_recent(10).await.unwrap();
+            let mutation_events = events
+                .iter()
+                .filter(|event| event.action == AuditAction::ChangeRequestFileView)
+                .collect::<Vec<_>>();
+            assert_eq!(mutation_events.len(), 1);
+        }
+    }
+
+    async fn review_fixture_empty_changed_paths() -> (AppState, String, String, Uuid) {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let commit = commit_file(&db, &mut root, "/legal.txt", "same", "same").await;
+        db.create_ref("review/cr-1", &commit).await.unwrap();
+        let main = db.get_ref("main").await.unwrap().unwrap();
+        db.update_ref("main", &main.target, main.version, &commit)
+            .await
+            .unwrap();
+        let state = test_state(db);
+        let change = state
+            .review
+            .create_change_request(NewChangeRequest {
+                title: "No diff".to_string(),
+                description: None,
+                source_ref: "review/cr-1".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: commit.clone(),
+                head_commit: commit.clone(),
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+        (state, commit.clone(), commit, change.id)
+    }
+
+    #[tokio::test]
+    async fn merge_change_request_blocks_when_required_files_unviewed() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                true,
+            )
+            .await
+            .unwrap();
+        approve_change_request_for(&state, id, "alice").await;
+
+        let blocked = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let blocked_body = response_json(blocked).await;
+        assert!(blocked_body["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires all changed files to be viewed"));
+        assert_eq!(
+            blocked_body["required_paths"],
+            serde_json::json!(["/legal.txt"])
+        );
+        assert_eq!(
+            blocked_body["unviewed_paths"],
+            serde_json::json!(["/legal.txt"])
+        );
+        assert_eq!(blocked_body["all_required_files_viewed"], false);
+        assert_eq!(blocked_body["require_all_files_viewed"], true);
+        assert_eq!(blocked_body["approval_state"]["approved"], true);
+    }
+
+    #[tokio::test]
+    async fn merge_change_request_allows_when_required_files_viewed() {
+        let (state, _base, head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                true,
+            )
+            .await
+            .unwrap();
+        approve_change_request_for(&state, id, "alice").await;
+
+        let marked = set_change_request_viewed_file(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(SetViewedFileRequest {
+                path: "/legal.txt".to_string(),
+                viewed: true,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(marked.status(), StatusCode::OK);
+
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        assert_eq!(response_json(merged).await["target_ref"]["target"], head);
+    }
+
+    #[tokio::test]
+    async fn merge_change_request_does_not_block_when_policy_does_not_require_viewed_files() {
+        let (state, _base, head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                false,
+            )
+            .await
+            .unwrap();
+        approve_change_request_for(&state, id, "alice").await;
+
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        assert_eq!(response_json(merged).await["target_ref"]["target"], head);
+    }
+
+    #[tokio::test]
+    async fn merge_change_request_treats_empty_changed_paths_as_viewed() {
+        let (state, _base, head, id) = review_fixture_empty_changed_paths().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_ref_rule_for_repo(&RepoId::local(), "main", 1, ROOT_UID, true)
+            .await
+            .unwrap();
+        approve_change_request_for(&state, id, "alice").await;
+
+        let listed = list_change_request_viewed_files(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+        )
+        .await
+        .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json(listed).await;
+        assert_eq!(listed_body["required_paths"], serde_json::json!([]));
+        assert_eq!(listed_body["all_required_files_viewed"], true);
+
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        assert_eq!(response_json(merged).await["target_ref"]["target"], head);
     }
 }
