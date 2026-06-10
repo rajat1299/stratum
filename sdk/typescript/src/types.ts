@@ -385,6 +385,34 @@ export interface CommentListResponse {
   readonly require_all_files_viewed: boolean;
 }
 
+export interface ViewedFileRecord {
+  readonly change_request_id: string;
+  readonly head_commit: string;
+  readonly path: string;
+  readonly viewed_by: number;
+  readonly viewed: boolean;
+  readonly version: number;
+}
+
+export interface ViewedFilesResponse {
+  readonly viewed_files: readonly ViewedFileRecord[];
+  readonly required_paths: readonly string[];
+  readonly unviewed_paths: readonly string[];
+  readonly all_required_files_viewed: boolean;
+  readonly require_all_files_viewed: boolean;
+  readonly approval_state: ApprovalState;
+}
+
+export interface UpdateViewedFileRequest {
+  readonly path: string;
+  readonly viewed: boolean;
+}
+
+export interface UpdateViewedFileResponse extends ViewedFilesResponse {
+  readonly viewed_file: ViewedFileRecord;
+  readonly updated: boolean;
+}
+
 export interface DismissApprovalRequest {
   readonly reason?: string;
 }

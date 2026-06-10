@@ -341,6 +341,34 @@ class CommentListResponse(TypedDict):
     require_all_files_viewed: bool
 
 
+class ViewedFileRecord(TypedDict):
+    change_request_id: str
+    head_commit: str
+    path: str
+    viewed_by: int
+    viewed: bool
+    version: int
+
+
+class ViewedFilesResponse(TypedDict):
+    viewed_files: list[ViewedFileRecord]
+    required_paths: list[str]
+    unviewed_paths: list[str]
+    all_required_files_viewed: bool
+    require_all_files_viewed: bool
+    approval_state: ApprovalState
+
+
+class UpdateViewedFileRequest(TypedDict):
+    path: str
+    viewed: bool
+
+
+class UpdateViewedFileResponse(ViewedFilesResponse):
+    viewed_file: ViewedFileRecord
+    updated: bool
+
+
 class DismissApprovalRequest(TypedDict, total=False):
     reason: str
 

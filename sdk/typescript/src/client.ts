@@ -33,6 +33,9 @@ import type {
   ReviewerListResponse,
   ReviewerRequest,
   ReviewerResponse,
+  UpdateViewedFileRequest,
+  UpdateViewedFileResponse,
+  ViewedFilesResponse,
   RunCreateRequest,
   RunCreateResponse,
   RunRecord,
@@ -486,6 +489,23 @@ export class ReviewsClient {
 
   listComments(id: string): Promise<CommentListResponse> {
     return this.http.json(`change-requests/${encodeRouteSegment(id)}/comments`, { method: "GET" });
+  }
+
+  listViewedFiles(id: string): Promise<ViewedFilesResponse> {
+    return this.http.json(`change-requests/${encodeRouteSegment(id)}/viewed-files`, { method: "GET" });
+  }
+
+  setViewedFile(
+    id: string,
+    request: UpdateViewedFileRequest,
+    options: StratumMutationOptions = {},
+  ): Promise<UpdateViewedFileResponse> {
+    return this.http.json(`change-requests/${encodeRouteSegment(id)}/viewed-files`, {
+      method: "PUT",
+      body: request,
+      idempotencyKey: options.idempotencyKey,
+      autoIdempotency: true,
+    });
   }
 
   dismissApproval(

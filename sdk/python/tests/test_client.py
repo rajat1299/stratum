@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import cast
 
 import httpx
+
 from stratum_sdk import BearerAuth, StratumClient
 from stratum_sdk.types import (
     ApprovalPolicyDecision,
@@ -492,6 +493,47 @@ def test_reviews_forward_protected_rule_file_view_flags() -> None:
         "required_approvals": 2,
         "require_all_files_viewed": False,
     }
+
+
+def test_reviews_list_viewed_files() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={"viewed_files": [], "required_paths": [], "unviewed_paths": []},
+        )
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as raw:
+        client = StratumClient("http://example.test/", http_client=raw)
+        client.reviews.list_viewed_files("cr1")
+
+    assert calls[0].method == "GET"
+    assert calls[0].url.path == "/change-requests/cr1/viewed-files"
+
+
+def test_reviews_set_viewed_file() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"viewed_file": {}, "updated": True})
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as raw:
+        client = StratumClient("http://example.test/", http_client=raw)
+        client.reviews.set_viewed_file(
+            "cr1",
+            {"path": "/a.md", "viewed": True},
+            idempotency_key="idem",
+        )
+
+    assert calls[0].method == "PUT"
+    assert calls[0].url.path == "/change-requests/cr1/viewed-files"
+    assert calls[0].headers["Idempotency-Key"] == "idem"
+    assert json.loads(calls[0].content.decode()) == {"path": "/a.md", "viewed": True}
 
 
 def test_runs_create_has_idempotency_and_json_body() -> None:

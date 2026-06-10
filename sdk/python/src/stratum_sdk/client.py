@@ -59,6 +59,9 @@ from stratum_sdk.types import (
     StratumStat,
     StratumWriteResult,
     UpdateRefRequest,
+    UpdateViewedFileRequest,
+    UpdateViewedFileResponse,
+    ViewedFilesResponse,
     WorkspaceCreateRequest,
     WorkspaceListResponse,
     WorkspaceRecord,
@@ -628,6 +631,33 @@ class ReviewsClient:
             self._http.request_json(
                 f"change-requests/{encode_route_segment(change_request_id)}/comments",
                 "GET",
+            ),
+        )
+
+    def list_viewed_files(self, change_request_id: str) -> ViewedFilesResponse:
+        return cast(
+            ViewedFilesResponse,
+            self._http.request_json(
+                f"change-requests/{encode_route_segment(change_request_id)}/viewed-files",
+                "GET",
+            ),
+        )
+
+    def set_viewed_file(
+        self,
+        change_request_id: str,
+        request: UpdateViewedFileRequest,
+        *,
+        idempotency_key: str | None = None,
+    ) -> UpdateViewedFileResponse:
+        return cast(
+            UpdateViewedFileResponse,
+            self._http.request_json(
+                f"change-requests/{encode_route_segment(change_request_id)}/viewed-files",
+                "PUT",
+                body=request,
+                idempotency_key=idempotency_key,
+                auto_idempotency=True,
             ),
         )
 

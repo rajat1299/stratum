@@ -560,6 +560,59 @@ describe("resource clients", () => {
     });
   });
 
+  it("lists viewed files for a change request", async () => {
+    const { fetchImpl, requests } = recordFetch();
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await client.reviews.listViewedFiles("cr1");
+
+    expect(requests[0]?.method).toBe("GET");
+    expect(requests[0]?.url).toBe("https://stratum.example/change-requests/cr1/viewed-files");
+  });
+
+  it("sets viewed file state with supplied idempotency", async () => {
+    const { fetchImpl, requests } = recordFetch();
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await client.reviews.setViewedFile(
+      "cr1",
+      { path: "/a.md", viewed: true },
+      { idempotencyKey: "idem" },
+    );
+
+    expect(requests[0]?.method).toBe("PUT");
+    expect(requests[0]?.url).toBe("https://stratum.example/change-requests/cr1/viewed-files");
+    expect(requests[0]?.headers.get("Idempotency-Key")).toBe("idem");
+    expect(await requestBody(requests[0]!)).toEqual({ path: "/a.md", viewed: true });
+  });
+
+  it("encodes change request route segments for viewed file calls", async () => {
+    const { fetchImpl, requests } = recordFetch();
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await client.reviews.listViewedFiles("legal bot#1");
+    await client.reviews.setViewedFile("legal bot#1", { path: "/a.md", viewed: true });
+
+    expect(requests[0]?.url).toBe(
+      "https://stratum.example/change-requests/legal%20bot%231/viewed-files",
+    );
+    expect(requests[1]?.url).toBe(
+      "https://stratum.example/change-requests/legal%20bot%231/viewed-files",
+    );
+  });
+
   it("builds run creation and raw stdout calls", async () => {
     const { fetchImpl, requests } = recordFetch(jsonResponse({ run_id: "run_1" }));
     const client = new StratumClient({
