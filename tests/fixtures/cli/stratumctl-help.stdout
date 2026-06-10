@@ -3,21 +3,22 @@ Remote-first stratum CLI
 Usage: stratumctl [OPTIONS] <COMMAND>
 
 Commands:
-  health     
-  ls         
-  cat        
-  write      
-  grep       
-  find       
-  tree       
-  commit     
-  log        
-  revert     
-  status     
-  diff       
-  workspace  
+  health
+  ls
+  cat
+  write
+  grep
+  find
+  tree
+  commit
+  log
+  revert
+  status
+  diff
+  workspace
+  change-request
   mount
-  help       Print this message or the help of the given subcommand(s)
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
       --url <URL>                          [env: STRATUM_URL=] [default: http://127.0.0.1:3000]

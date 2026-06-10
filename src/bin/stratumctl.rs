@@ -84,6 +84,10 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    ChangeRequest {
+        #[command(subcommand)]
+        command: ChangeRequestCommand,
+    },
     Mount {
         #[command(subcommand)]
         command: MountCommand,
@@ -121,6 +125,24 @@ enum WorkspaceCommand {
         session_ref: Option<String>,
         #[arg(long = "env-out")]
         env_out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChangeRequestCommand {
+    Create {
+        #[arg(long = "session-ref")]
+        session_ref: Option<String>,
+        #[arg(long = "target-ref", default_value = "main")]
+        target_ref: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -332,6 +354,31 @@ async fn main() {
                 }
             }
         },
+        Command::ChangeRequest { ref command } => match command {
+            ChangeRequestCommand::Create {
+                session_ref,
+                target_ref,
+                title,
+                description,
+                idempotency_key,
+                json,
+            } => match client
+                .create_change_request_from_session(
+                    title.as_deref().unwrap_or(""),
+                    description.as_deref(),
+                    session_ref.as_deref().unwrap_or(""),
+                    target_ref,
+                    idempotency_key.as_deref(),
+                )
+                .await
+            {
+                Ok(response) => {
+                    print!("{}", render_change_request_created(&response, *json));
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
+        },
         Command::Mount { .. } => unreachable!("mount commands are handled before auth resolution"),
     };
 
@@ -348,6 +395,20 @@ fn run_mount_command(command: &MountCommand) -> Result<String, VfsError> {
         UnavailableMountDaemonIpcClient,
     );
     render_mount_command(command, &controller)
+}
+
+fn render_change_request_created(
+    response: &stratum::client::ClientChangeRequestResponse,
+    json: bool,
+) -> String {
+    if json {
+        return format!("{}\n", serde_json::to_string_pretty(response).unwrap());
+    }
+    let cr = &response.change_request;
+    format!(
+        "change request {} {} {} -> {}\nbase {}\nhead {}\n",
+        cr.id, cr.status, cr.source_ref, cr.target_ref, cr.base_commit, cr.head_commit
+    )
 }
 
 fn render_mount_command<P, F, I>(
@@ -969,6 +1030,144 @@ mod tests {
         assert_eq!(agent_token, "agent-secret");
         assert_eq!(read_prefixes, vec!["/demo/read", "/demo/shared"]);
         assert_eq!(write_prefixes, vec!["/demo/write"]);
+    }
+
+    #[test]
+    fn change_request_create_command_parses_flags() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+        let cli = Cli::try_parse_from([
+            "stratumctl",
+            "change-request",
+            "create",
+            "--session-ref",
+            "agent/incident-demo/session",
+            "--target-ref",
+            "main",
+            "--title",
+            "Investigate checkout latency",
+            "--description",
+            "Agent incident update",
+            "--idempotency-key",
+            "incident-cr-1",
+            "--json",
+        ])
+        .unwrap();
+
+        let Command::ChangeRequest {
+            command:
+                ChangeRequestCommand::Create {
+                    session_ref,
+                    target_ref,
+                    title,
+                    description,
+                    idempotency_key,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("expected change-request create command");
+        };
+
+        assert_eq!(session_ref.as_deref(), Some("agent/incident-demo/session"));
+        assert_eq!(target_ref, "main");
+        assert_eq!(title.as_deref(), Some("Investigate checkout latency"));
+        assert_eq!(description.as_deref(), Some("Agent incident update"));
+        assert_eq!(idempotency_key.as_deref(), Some("incident-cr-1"));
+        assert!(json);
+    }
+
+    #[test]
+    fn change_request_create_defaults_target_ref_to_main() {
+        let cli = Cli::try_parse_from([
+            "stratumctl",
+            "change-request",
+            "create",
+            "--session-ref",
+            "agent/incident-demo/session",
+            "--title",
+            "Investigate checkout latency",
+        ])
+        .unwrap();
+
+        let Command::ChangeRequest {
+            command: ChangeRequestCommand::Create { target_ref, .. },
+        } = cli.command
+        else {
+            panic!("expected change-request create command");
+        };
+
+        assert_eq!(target_ref, "main");
+    }
+
+    #[test]
+    fn change_request_create_parses_omitted_fields_for_local_validation() {
+        let missing_session_ref = Cli::try_parse_from([
+            "stratumctl",
+            "change-request",
+            "create",
+            "--title",
+            "Investigate checkout latency",
+        ])
+        .unwrap();
+        let Command::ChangeRequest {
+            command:
+                ChangeRequestCommand::Create {
+                    session_ref, title, ..
+                },
+        } = missing_session_ref.command
+        else {
+            panic!("expected change-request create command");
+        };
+        assert_eq!(session_ref, None);
+        assert_eq!(title.as_deref(), Some("Investigate checkout latency"));
+
+        let missing_title = Cli::try_parse_from([
+            "stratumctl",
+            "change-request",
+            "create",
+            "--session-ref",
+            "agent/incident-demo/session",
+        ])
+        .unwrap();
+        let Command::ChangeRequest {
+            command:
+                ChangeRequestCommand::Create {
+                    session_ref, title, ..
+                },
+        } = missing_title.command
+        else {
+            panic!("expected change-request create command");
+        };
+        assert_eq!(session_ref.as_deref(), Some("agent/incident-demo/session"));
+        assert_eq!(title, None);
+    }
+
+    #[test]
+    fn change_request_text_output_is_metadata_only() {
+        let response = stratum::client::ClientChangeRequestResponse {
+            change_request: stratum::client::ClientChangeRequest {
+                id: "cr-1".to_string(),
+                title: "Investigate checkout latency".to_string(),
+                description: Some("Agent incident update".to_string()),
+                source_ref: "agent/incident-demo/session".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: "a".repeat(40),
+                head_commit: "b".repeat(40),
+                status: "open".to_string(),
+                created_by: 0,
+                version: 1,
+            },
+            approval_state: serde_json::json!({"approved": true}),
+            require_all_files_viewed: false,
+        };
+
+        let output = render_change_request_created(&response, false);
+
+        assert!(output.contains("change request cr-1 open agent/incident-demo/session -> main"));
+        assert!(output.contains(&"a".repeat(40)));
+        assert!(output.contains(&"b".repeat(40)));
+        assert!(!output.contains("Agent incident update"));
+        assert!(!output.contains("incident-cr-1"));
     }
 
     #[test]

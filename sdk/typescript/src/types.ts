@@ -239,6 +239,13 @@ export interface ChangeRequestCreateRequest {
   readonly target_ref: string;
 }
 
+export interface ChangeRequestFromSessionRequest {
+  readonly title: string;
+  readonly description?: string | null;
+  readonly session_ref: string;
+  readonly target_ref?: string;
+}
+
 export interface ChangeRequest {
   readonly id: string;
   readonly title: string;

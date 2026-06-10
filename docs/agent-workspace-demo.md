@@ -207,6 +207,22 @@ curl -s http://localhost:3000/vcs/log \
   -H "Authorization: User root" | jq
 ```
 
+Open a change request from an existing source/session ref to `main`:
+
+```bash
+cargo run --release --bin stratumctl -- \
+  --url http://127.0.0.1:3000 \
+  --user root \
+  change-request create \
+  --session-ref agent/incident-demo/session \
+  --target-ref main \
+  --title "Incident update" \
+  --description "Agent changes from the mounted incident workspace." \
+  --idempotency-key incident-demo-cr-1
+```
+
+For the local demo, use `--user root` for admin change-request creation. In a hosted durable preview, use the repo-bound workspace bearer form with `--workspace-id`, `--workspace-token`, and `--repo` instead. If the source ref does not exist, the server returns a bounded error and `stratumctl` exits non-zero.
+
 ### Minute 4-5: Show rollback
 
 Make a bad edit:

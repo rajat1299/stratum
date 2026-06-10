@@ -451,6 +451,82 @@ describe("resource clients", () => {
     expect(await requestBody(requests[0]!)).toEqual({ body: "Please update", kind: "changes_requested" });
   });
 
+  it("creates change requests from session refs with supplied idempotency", async () => {
+    const { fetchImpl, requests } = recordFetch();
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await client.reviews.createChangeRequestFromSession(
+      {
+        title: "Investigate checkout latency",
+        description: "Agent incident update",
+        session_ref: "agent/incident-demo/session",
+        target_ref: "main",
+      },
+      { idempotencyKey: "incident-cr-1" },
+    );
+
+    expect(requests[0]?.method).toBe("POST");
+    expect(requests[0]?.url).toBe("https://stratum.example/change-requests");
+    expect(requests[0]?.headers.get("Idempotency-Key")).toBe("incident-cr-1");
+    expect(await requestBody(requests[0]!)).toEqual({
+      title: "Investigate checkout latency",
+      description: "Agent incident update",
+      source_ref: "agent/incident-demo/session",
+      target_ref: "main",
+    });
+  });
+
+  it("defaults session change requests to main and auto idempotency", async () => {
+    const { fetchImpl, requests } = recordFetch();
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      idempotencyKeyPrefix: "test-sdk",
+      fetch: fetchImpl,
+    });
+
+    await client.reviews.createChangeRequestFromSession({
+      title: "Investigate checkout latency",
+      session_ref: "agent/incident-demo/session",
+    });
+
+    expect(requests[0]?.headers.get("Idempotency-Key")).toMatch(/^test-sdk-/);
+    expect(await requestBody(requests[0]!)).toEqual({
+      title: "Investigate checkout latency",
+      source_ref: "agent/incident-demo/session",
+      target_ref: "main",
+    });
+  });
+
+  it("rejects invalid session change request inputs before fetch", async () => {
+    const { fetchImpl, requests } = recordFetch();
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await expect(
+      client.reviews.createChangeRequestFromSession({ title: "", session_ref: "agent/session" }),
+    ).rejects.toThrow("title is required");
+    await expect(
+      client.reviews.createChangeRequestFromSession({ title: "Review", session_ref: "" }),
+    ).rejects.toThrow("session_ref is required");
+    await expect(
+      client.reviews.createChangeRequestFromSession({
+        title: "Review",
+        session_ref: "agent/session",
+        target_ref: " ",
+      }),
+    ).rejects.toThrow("target_ref is required");
+
+    expect(requests).toHaveLength(0);
+  });
+
   it("forwards protected rule file-view flags", async () => {
     const { fetchImpl, requests } = recordFetch();
     const client = new StratumClient({

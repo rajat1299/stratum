@@ -299,10 +299,10 @@ async function runIncidentChangeRequestExampleWithConfig(
   const sourceRef = sourceRefName(now());
   await adminClient.vcs.createRef({ name: sourceRef, target: updateCommit });
 
-  const changeRequest = await adminClient.reviews.createChangeRequest({
+  const changeRequest = await adminClient.reviews.createChangeRequestFromSession({
     title: plan.title,
     description: plan.description,
-    source_ref: sourceRef,
+    session_ref: sourceRef,
     target_ref: TARGET_REF,
   });
 

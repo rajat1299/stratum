@@ -8,6 +8,7 @@ import type {
   AuditListOptions,
   AuditListResponse,
   ChangeRequestCreateRequest,
+  ChangeRequestFromSessionRequest,
   ChangeRequestListResponse,
   ChangeRequestResponse,
   CapabilityManifest,
@@ -426,6 +427,24 @@ export class ReviewsClient {
     });
   }
 
+  async createChangeRequestFromSession(
+    request: ChangeRequestFromSessionRequest,
+    options: StratumMutationOptions = {},
+  ): Promise<ChangeRequestResponse> {
+    const title = requiredReviewField(request.title, "title");
+    const sourceRef = requiredReviewField(request.session_ref, "session_ref");
+    const targetRef = requiredReviewField(request.target_ref ?? "main", "target_ref");
+    return this.createChangeRequest(
+      {
+        title,
+        ...(request.description !== undefined ? { description: request.description } : {}),
+        source_ref: sourceRef,
+        target_ref: targetRef,
+      },
+      options,
+    );
+  }
+
   approve(id: string, request: ApprovalRequest = {}, options: StratumMutationOptions = {}): Promise<ApprovalResponse> {
     return this.http.json(`change-requests/${encodeRouteSegment(id)}/approvals`, {
       method: "POST",
@@ -501,6 +520,13 @@ export class ReviewsClient {
       autoIdempotency: true,
     });
   }
+}
+
+function requiredReviewField(value: string, name: string): string {
+  if (value.trim() === "") {
+    throw new Error(`${name} is required`);
+  }
+  return value;
 }
 
 export class RunsClient {

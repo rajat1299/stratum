@@ -71,6 +71,16 @@ const token = await admin.workspaces.issueToken(workspace.id, {
 
 const status = await admin.vcs.status();
 const patch = await admin.vcs.diff("/incidents/checkout-latency/work/report.md");
+
+const cr = await admin.reviews.createChangeRequestFromSession(
+  {
+    title: "Incident update",
+    description: "Agent changes from the mounted incident workspace.",
+    session_ref: "agent/incident-demo/session",
+    target_ref: "main",
+  },
+  { idempotencyKey: "incident-demo-cr-1" },
+);
 ```
 
 Global VCS routes are admin-gated by the current Stratum server. Workspace bearer clients may use filesystem,

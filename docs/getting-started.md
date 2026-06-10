@@ -198,7 +198,7 @@ cargo run --release --bin stratumctl -- --url http://127.0.0.1:3000 --token "$ST
 cargo run --release --bin stratumctl -- \
   --url http://127.0.0.1:3000 \
   --workspace-id "<workspace-uuid>" \
-  --workspace-token "<workspace-secret>" \
+  --workspace-token "<workspace-token>" \
   ls /read
 
 # Issue a scoped workspace token as an admin
@@ -216,7 +216,20 @@ cargo run --release --bin stratumctl -- \
   --user root \
   workspace seed-demo
 source .stratum-demo/incident-workspace.env
+
+# Open a change request from an existing session/source ref to main
+cargo run --release --bin stratumctl -- \
+  --url http://127.0.0.1:3000 \
+  --user root \
+  change-request create \
+  --session-ref agent/incident-demo/session \
+  --target-ref main \
+  --title "Incident update" \
+  --description "Agent changes from the mounted incident workspace." \
+  --idempotency-key incident-demo-cr-1
 ```
+
+The command assumes the source/session ref already exists; it does not create refs, commit workspace changes, or infer state from the workspace env file.
 
 If no `--read-prefix` or `--write-prefix` flags are supplied, the issued workspace token defaults both scopes to the workspace root. Repeating a flag adds another allowed backing prefix. Workspace bearer tokens expose the workspace root as `/` for filesystem, search, and tree routes, so clients use workspace-relative paths like `/read` rather than `/incidents/checkout-latency/read`. Workspace bearer tokens cannot manage workspace metadata. Global VCS routes remain admin-gated.
 

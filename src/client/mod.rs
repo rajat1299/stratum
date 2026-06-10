@@ -119,6 +119,27 @@ impl fmt::Debug for ClientIssuedWorkspaceToken {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientChangeRequest {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub source_ref: String,
+    pub target_ref: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub status: String,
+    pub created_by: u32,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientChangeRequestResponse {
+    pub change_request: ClientChangeRequest,
+    pub approval_state: serde_json::Value,
+    pub require_all_files_viewed: bool,
+}
+
 #[derive(Serialize)]
 struct CreateWorkspaceRequest<'a> {
     name: &'a str,
@@ -137,6 +158,15 @@ struct IssueWorkspaceTokenRequest<'a> {
     read_prefixes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     write_prefixes: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct CreateChangeRequestRequest<'a> {
+    title: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    source_ref: &'a str,
+    target_ref: &'a str,
 }
 
 impl StratumClient {
@@ -365,6 +395,35 @@ impl StratumClient {
         Self::ensure_success(response.status(), response.text().await.unwrap_or_default())
     }
 
+    pub async fn create_change_request_from_session(
+        &self,
+        title: &str,
+        description: Option<&str>,
+        session_ref: &str,
+        target_ref: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<ClientChangeRequestResponse, VfsError> {
+        let title = require_change_request_arg(title, "--title")?;
+        let session_ref = require_change_request_arg(session_ref, "--session-ref")?;
+        let target_ref = require_change_request_arg(target_ref, "--target-ref")?;
+        let mut headers = self.headers()?;
+        if let Some(key) = idempotency_key {
+            headers.insert("idempotency-key", idempotency_header_value(key)?);
+        }
+        self.json_with_headers(
+            self.client
+                .post(format!("{}/change-requests", self.base_url))
+                .json(&CreateChangeRequestRequest {
+                    title,
+                    description,
+                    source_ref: session_ref,
+                    target_ref,
+                }),
+            headers,
+        )
+        .await
+    }
+
     pub async fn list_workspaces(&self) -> Result<serde_json::Value, VfsError> {
         self.json(self.client.get(format!("{}/workspaces", self.base_url)))
             .await
@@ -500,8 +559,19 @@ impl StratumClient {
     where
         T: for<'de> Deserialize<'de>,
     {
+        self.json_with_headers(builder, self.headers()?).await
+    }
+
+    async fn json_with_headers<T>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        headers: HeaderMap,
+    ) -> Result<T, VfsError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
         let response = builder
-            .headers(self.headers()?)
+            .headers(headers)
             .send()
             .await
             .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
@@ -551,6 +621,38 @@ fn sensitive_header_value(label: &str, value: &str) -> Result<HeaderValue, VfsEr
     })?;
     value.set_sensitive(true);
     Ok(value)
+}
+
+fn require_change_request_arg<'a>(value: &'a str, flag: &str) -> Result<&'a str, VfsError> {
+    if value.trim().is_empty() {
+        return Err(VfsError::InvalidArgs {
+            message: format!("change-request create requires {flag}"),
+        });
+    }
+    Ok(value)
+}
+
+fn idempotency_header_value(value: &str) -> Result<HeaderValue, VfsError> {
+    if value.is_empty() {
+        return Err(VfsError::InvalidArgs {
+            message: "Idempotency-Key must not be empty".to_string(),
+        });
+    }
+    if value.len() > 255 {
+        return Err(VfsError::InvalidArgs {
+            message: "Idempotency-Key must be at most 255 bytes".to_string(),
+        });
+    }
+    if !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(VfsError::InvalidArgs {
+            message: "Idempotency-Key must contain visible ASCII only".to_string(),
+        });
+    }
+    let mut header = HeaderValue::from_str(value).map_err(|_| VfsError::InvalidArgs {
+        message: "Idempotency-Key must contain visible ASCII only".to_string(),
+    })?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 #[cfg(test)]
@@ -628,6 +730,42 @@ mod tests {
             Json(record_headers(&records, headers))
         }
 
+        async fn change_request_echo(
+            State(records): State<HeaderRecords>,
+            headers: AxumHeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            record_headers(&records, headers);
+            Json(serde_json::json!({
+                "change_request": {
+                    "id": "cr-1",
+                    "title": body["title"],
+                    "description": body.get("description").cloned().unwrap_or(Value::Null),
+                    "source_ref": body["source_ref"],
+                    "target_ref": body["target_ref"],
+                    "base_commit": "a".repeat(40),
+                    "head_commit": "b".repeat(40),
+                    "status": "open",
+                    "created_by": 0,
+                    "version": 1
+                },
+                "approval_state": {
+                    "change_request_id": "cr-1",
+                    "required_approvals": 0,
+                    "approval_count": 0,
+                    "approved_by": [],
+                    "required_reviewers": [],
+                    "approved_required_reviewers": [],
+                    "missing_required_reviewers": [],
+                    "approved": true,
+                    "matched_ref_rules": [],
+                    "matched_path_rules": [],
+                    "require_all_files_viewed": false
+                },
+                "require_all_files_viewed": false
+            }))
+        }
+
         async fn text_echo(
             State(records): State<HeaderRecords>,
             headers: AxumHeaderMap,
@@ -661,6 +799,7 @@ mod tests {
             .route("/vcs/log", get(log_echo))
             .route("/workspaces", get(value_echo).post(value_echo))
             .route("/workspaces/{workspace_id}/tokens", post(value_echo))
+            .route("/change-requests", post(change_request_echo))
             .route("/fs/{*path}", get(text_echo).put(stable_501))
             .route("/tree", get(text_echo))
             .route("/tree/{*path}", get(text_echo))
@@ -708,6 +847,7 @@ mod tests {
             "authorization": header_value(&headers, "authorization"),
             "x-stratum-workspace": header_value(&headers, "x-stratum-workspace"),
             "x-stratum-repo": header_value(&headers, "x-stratum-repo"),
+            "idempotency-key": header_value(&headers, "idempotency-key"),
         });
         records.lock().unwrap().push(value.clone());
         value
@@ -893,6 +1033,130 @@ mod tests {
         for value in values {
             assert_workspace_repo_headers(&value);
         }
+    }
+
+    #[tokio::test]
+    async fn create_change_request_sends_workspace_repo_auth_and_idempotency() {
+        let (base_url, server, records) = spawn_header_echo_server().await;
+        let client = workspace_repo_client(base_url);
+
+        let response = client
+            .create_change_request_from_session(
+                "Investigate checkout latency",
+                Some("Agent incident update"),
+                "agent/incident-demo/session",
+                "main",
+                Some("incident-cr-1"),
+            )
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.change_request.id, "cr-1");
+        assert_eq!(
+            response.change_request.source_ref,
+            "agent/incident-demo/session"
+        );
+        assert_eq!(response.change_request.target_ref, "main");
+
+        let values = recorded_headers(&records);
+        assert_eq!(values.len(), 1);
+        assert_workspace_repo_headers(&values[0]);
+        assert_eq!(
+            values[0].get("idempotency-key"),
+            Some(&Value::String("incident-cr-1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_change_request_rejects_empty_inputs_without_echoing_secrets() {
+        let client = StratumClient::new("http://127.0.0.1:3000", ClientAuth::Root);
+
+        for (title, description, session_ref, target_ref, expected) in [
+            (
+                "",
+                None,
+                "agent/session",
+                "main",
+                "change-request create requires --title",
+            ),
+            (
+                "Review",
+                None,
+                "",
+                "main",
+                "change-request create requires --session-ref",
+            ),
+            (
+                "Review",
+                None,
+                "agent/session",
+                "",
+                "change-request create requires --target-ref",
+            ),
+        ] {
+            let err = client
+                .create_change_request_from_session(
+                    title,
+                    description,
+                    session_ref,
+                    target_ref,
+                    None,
+                )
+                .await
+                .expect_err("empty input should fail");
+            let VfsError::InvalidArgs { message } = err else {
+                panic!("empty input should return InvalidArgs");
+            };
+            assert_eq!(message, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_change_request_rejects_invalid_idempotency_key_without_echoing_value() {
+        let client = StratumClient::new("http://127.0.0.1:3000", ClientAuth::Root);
+        for (key, expected) in [
+            ("", "Idempotency-Key must not be empty"),
+            (
+                "has space secret",
+                "Idempotency-Key must contain visible ASCII only",
+            ),
+        ] {
+            let err = client
+                .create_change_request_from_session(
+                    "Review",
+                    None,
+                    "agent/session",
+                    "main",
+                    Some(key),
+                )
+                .await
+                .expect_err("invalid idempotency key should fail");
+            let VfsError::InvalidArgs { message } = err else {
+                panic!("invalid idempotency should return InvalidArgs");
+            };
+            assert_eq!(message, expected);
+            if !key.is_empty() {
+                assert!(!message.contains(key));
+            }
+        }
+
+        let long_key = "x".repeat(256);
+        let err = client
+            .create_change_request_from_session(
+                "Review",
+                None,
+                "agent/session",
+                "main",
+                Some(&long_key),
+            )
+            .await
+            .expect_err("invalid idempotency key should fail");
+        let VfsError::InvalidArgs { message } = err else {
+            panic!("invalid idempotency should return InvalidArgs");
+        };
+        assert_eq!(message, "Idempotency-Key must be at most 255 bytes");
+        assert!(!message.contains(&long_key));
     }
 
     #[tokio::test]
