@@ -34,6 +34,7 @@ import {
   useRevertChangeRequest,
 } from "../lib/api/reviews.ts";
 import { parseDiff } from "../lib/diff-parser.ts";
+import { formatReviewActor, formatReviewActorList } from "../lib/review-actors.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen
@@ -298,7 +299,7 @@ function mergeBlockReason({
   if (!("approved" in approval)) return "Approval status is unavailable.";
 
   if (approval.missing_required_reviewers.length > 0) {
-    const names = approval.missing_required_reviewers.map((uid) => `Reviewer ${uid}`).join(", ");
+    const names = formatReviewActorList(approval.missing_required_reviewers);
     return `Waiting for ${names}.`;
   }
 
@@ -474,7 +475,7 @@ function CommentRow({ comment }: { readonly comment: ReviewComment }) {
       className={`px-4 py-3 text-[13px] ${comment.active ? "text-stone-800" : "text-stone-400"}`}
     >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
-        <span>Reviewer {comment.author}</span>
+        <span>{formatReviewActor(comment.author)}</span>
         <span aria-hidden className="text-stone-300">
           ·
         </span>
@@ -654,9 +655,9 @@ function ReviewerRow({ assignment }: { readonly assignment: ReviewerAssignment }
       }`}
     >
       <div className="min-w-0">
-        <div className="font-medium">Reviewer {assignment.reviewer}</div>
+        <div className="font-medium">{formatReviewActor(assignment.reviewer)}</div>
         <div className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
-          assigned by {assignment.assigned_by}
+          assigned by {formatReviewActor(assignment.assigned_by)}
         </div>
       </div>
       <div className="flex flex-wrap justify-end gap-1">
@@ -725,14 +726,14 @@ function ApprovalDetail({ item }: { readonly item: ChangeRequestResponse }) {
             {a.approved_by.length === 0 ? (
               <span className="text-stone-400">—</span>
             ) : (
-              <span className="font-mono">{a.approved_by.map((u) => `uid:${u}`).join(", ")}</span>
+              <span className="font-mono">{formatReviewActorList(a.approved_by)}</span>
             )}
           </Row>
           {a.required_reviewers.length > 0 && (
             <Row k="Required reviewers">
               <span className="font-mono">
                 {a.required_reviewers
-                  .map((u) => `uid:${u}${a.approved_required_reviewers.includes(u) ? " ✓" : ""}`)
+                  .map((u) => `${formatReviewActor(u)}${a.approved_required_reviewers.includes(u) ? " ✓" : ""}`)
                   .join(", ")}
               </span>
             </Row>
@@ -740,7 +741,7 @@ function ApprovalDetail({ item }: { readonly item: ChangeRequestResponse }) {
           {a.missing_required_reviewers.length > 0 && (
             <Row k="Missing reviewers">
               <span className="font-mono text-amber-700">
-                {a.missing_required_reviewers.map((u) => `uid:${u}`).join(", ")}
+                {a.missing_required_reviewers.map((u) => formatReviewActor(u)).join(", ")}
               </span>
             </Row>
           )}
@@ -828,13 +829,23 @@ function ApprovalRow({
         </span>
         <div className="min-w-0">
           <div className="font-mono text-stone-500 line-through">
-            uid:{approval.approved_by}
-            {approval.comment ? ` — "${approval.comment}"` : ""}
+            {formatReviewActor(approval.approved_by)}
           </div>
+          {approval.comment ? (
+            <div className="font-mono text-[11px] text-stone-500">
+              Reason: {approval.comment}
+            </div>
+          ) : (
+            <div className="font-mono text-[11px] text-stone-400">No reason recorded</div>
+          )}
           <div className="font-mono text-[11px] text-stone-500">
-            dismissed by uid:{approval.dismissed_by ?? "?"}
-            {approval.dismissal_reason ? ` · "${approval.dismissal_reason}"` : ""}
+            dismissed by {formatReviewActor(approval.dismissed_by)}
           </div>
+          {approval.dismissal_reason ? (
+            <div className="font-mono text-[11px] text-stone-500">
+              Dismissal reason: {approval.dismissal_reason}
+            </div>
+          ) : null}
         </div>
         <span className="font-mono text-[10px] uppercase tracking-wider text-stone-400">
           dismissed
@@ -845,15 +856,19 @@ function ApprovalRow({
 
   return (
     <div className="px-4 py-2">
-      <div className="grid grid-cols-[60px_1fr_auto] items-center gap-3 text-[12.5px]">
+      <div className="grid grid-cols-[60px_1fr_auto] items-start gap-3 text-[12.5px]">
         <span aria-hidden className="text-emerald-600">
           ✓
         </span>
         <div className="min-w-0 font-mono text-stone-800">
-          uid:{approval.approved_by}
+          {formatReviewActor(approval.approved_by)}
           {approval.comment ? (
-            <span className="text-stone-500"> — "{approval.comment}"</span>
-          ) : null}
+            <div className="mt-0.5 text-[11px] font-normal text-stone-600">
+              Reason: {approval.comment}
+            </div>
+          ) : (
+            <div className="mt-0.5 text-[11px] font-normal text-stone-400">No reason recorded</div>
+          )}
         </div>
         {!showForm && (
           <button

@@ -323,7 +323,7 @@ describe("ChangeRequestDetail — populated", () => {
     renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)));
     await screen.findByRole("heading", { name: /^approval state$/i });
     expect(screen.getByText("approved")).toBeTruthy();
-    expect(screen.getByText(/uid:42/)).toBeTruthy();
+    expect(screen.getByText(/Reviewer 42/)).toBeTruthy();
   });
 
   it("fetches and renders the CR-scoped diff with the recorded base + head commits", async () => {
@@ -477,7 +477,7 @@ const APPROVALS_LIST = {
       change_request_id: "cr-1",
       head_commit: "a4f9c1b2" + "0".repeat(56),
       approved_by: 42,
-      comment: "lgtm",
+      comment: "looks good",
       active: true,
       version: 1,
     },
@@ -517,13 +517,16 @@ describe("ChangeRequestDetail — approvals list (D3.4)", () => {
     });
     // Section header
     expect(await screen.findByText(/^Approvals$/)).toBeTruthy();
-    // Active approval: uid + comment visible, Dismiss button present
-    expect(screen.getByText(/uid:42/)).toBeTruthy();
-    expect(screen.getByText(/lgtm/)).toBeTruthy();
+    // Active approval: actor label + explicit reason, Dismiss button present
+    expect(screen.getByText(/Reviewer 42/)).toBeTruthy();
+    expect(screen.getByText(/Reason:/)).toBeTruthy();
+    expect(screen.getByText(/looks good/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /^dismiss$/i })).toBeTruthy();
     // Dismissed approval: dismissal trail visible, no Dismiss button on it
-    expect(screen.getByText(/uid:17/)).toBeTruthy();
-    expect(screen.getByText(/dismissed by uid:0/)).toBeTruthy();
+    expect(screen.getByText(/Reviewer 17/)).toBeTruthy();
+    expect(screen.getByText(/No reason recorded/)).toBeTruthy();
+    expect(screen.getByText(/dismissed by root/)).toBeTruthy();
+    expect(screen.getByText(/Dismissal reason:/)).toBeTruthy();
     expect(screen.getByText(/stale head/)).toBeTruthy();
   });
 
@@ -724,6 +727,7 @@ describe("ChangeRequestDetail — comments (D4)", () => {
     });
     expect(await screen.findByRole("heading", { name: /^comments$/i })).toBeTruthy();
     expect(screen.getByText(/align the cap/i)).toBeTruthy();
+    expect(screen.getByText(/Reviewer 42/)).toBeTruthy();
     expect(screen.getByText(/changes requested/i)).toBeTruthy();
     expect(screen.getByText("/contracts/acme.md")).toBeTruthy();
     expect(screen.getByText(/updated the cap language/i)).toBeTruthy();

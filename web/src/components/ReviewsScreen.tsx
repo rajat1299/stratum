@@ -34,6 +34,7 @@ import {
   filterAndSearch,
   type Filter,
 } from "../lib/api/reviews-filter.ts";
+import { formatReviewActor } from "../lib/review-actors.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Filter state contract
@@ -347,6 +348,8 @@ function ChangeRequestCard({
           {cr.title}
         </h3>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-stone-500">
+          <span>{formatReviewActor(cr.created_by, agentish ? { kind: "agent" } : {})}</span>
+          <span aria-hidden className="text-stone-300">·</span>
           <span>{cr.source_ref}</span>
           <span aria-hidden>→</span>
           <span>{cr.target_ref}</span>

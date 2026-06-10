@@ -207,6 +207,14 @@ describe("ReviewsScreen — populated state", () => {
     expect(screen.getAllByTitle(/human-authored/i).length).toBeGreaterThan(0);
   });
 
+  it("renders polished actor labels without raw uid: text", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    const articles = await screen.findAllByRole("article");
+    expect(within(articles[0]!).getByText("Agent 101")).toBeTruthy();
+    expect(within(articles[1]!).getByText("Reviewer 1")).toBeTruthy();
+    expect(screen.queryByText(/uid:/)).toBeNull();
+  });
+
   it("renders the four filter chips with per-status counts", async () => {
     renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
     const group = await screen.findByRole("radiogroup", { name: /filter by status/i });
