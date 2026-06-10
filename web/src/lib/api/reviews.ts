@@ -33,6 +33,8 @@ import type {
   ReviewerRequest,
   ReviewerResponse,
   StratumRevertResult,
+  UpdateViewedFileResponse,
+  ViewedFilesResponse,
 } from "@stratum/sdk";
 import {
   useMutation,
@@ -61,6 +63,7 @@ export const reviewKeys = {
   reviewers: (id: string) => [...reviewKeys.all, "reviewers", id] as const,
   comments: (id: string) => [...reviewKeys.all, "comments", id] as const,
   diff: (base: string, head: string) => [...reviewKeys.all, "diff", base, head] as const,
+  viewedFiles: (id: string) => [...reviewKeys.all, "viewed-files", id] as const,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,6 +465,49 @@ export function useCreateComment(): UseMutationResult<
     },
     onSuccess: (_data, vars) => {
       void queryClient.invalidateQueries({ queryKey: reviewKeys.comments(vars.id) });
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// useViewedFiles / useSetViewedFile — file-viewed merge gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the current actor's viewed-file state for a CR's head commit.
+ * Drives the per-file checkboxes and merge gate in the detail screen.
+ */
+export function useViewedFiles(id: string): UseQueryResult<ViewedFilesResponse, Error> {
+  const client = useStratumClient();
+  return useQuery({
+    queryKey: reviewKeys.viewedFiles(id),
+    queryFn: () => client.reviews.listViewedFiles(id),
+    staleTime: 30_000,
+    retry: (failureCount, error) => !isTerminalHttpError(error) && failureCount < 2,
+  });
+}
+
+/**
+ * PUT /change-requests/:id/viewed-files — mark one changed path viewed or
+ * unviewed for the current actor. Invalidates viewed-files, detail, and list
+ * so approval_state and merge readiness stay in sync.
+ */
+export function useSetViewedFile(): UseMutationResult<
+  UpdateViewedFileResponse,
+  Error,
+  { readonly id: string; readonly path: string; readonly viewed: boolean }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, path, viewed }) => {
+      const idempotencyKey = newIdempotencyKey();
+      return client.reviews.setViewedFile(id, { path, viewed }, { idempotencyKey });
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.viewedFiles(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
     },
   });
 }

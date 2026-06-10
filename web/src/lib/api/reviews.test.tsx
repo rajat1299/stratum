@@ -20,6 +20,8 @@ import {
   useReviewers,
   useRevertChangeRequest,
   useRejectChangeRequest,
+  useSetViewedFile,
+  useViewedFiles,
 } from "./reviews.ts";
 import { act } from "@testing-library/react";
 
@@ -112,6 +114,7 @@ describe("reviewKeys — stable factory", () => {
     expect(reviewKeys.reviewers("cr-42")).toEqual(["change-requests", "reviewers", "cr-42"]);
     expect(reviewKeys.comments("cr-42")).toEqual(["change-requests", "comments", "cr-42"]);
     expect(reviewKeys.diff("base", "head")).toEqual(["change-requests", "diff", "base", "head"]);
+    expect(reviewKeys.viewedFiles("cr-42")).toEqual(["change-requests", "viewed-files", "cr-42"]);
   });
 });
 
@@ -754,5 +757,92 @@ describe("useCreateComment", () => {
     });
     const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
     expect(calledKeys).not.toContainEqual(reviewKeys.detail("cr-1"));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Viewed files
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VIEWED_FILES_RESPONSE = {
+  viewed_files: [
+    {
+      change_request_id: "cr-1",
+      head_commit: "a4f9c1b2" + "0".repeat(56),
+      path: "/contracts/acme.md",
+      viewed_by: 1,
+      viewed: true,
+      version: 1,
+    },
+  ],
+  required_paths: ["/contracts/acme.md"],
+  unviewed_paths: [],
+  all_required_files_viewed: true,
+  require_all_files_viewed: true,
+  approval_state: SAMPLE.change_requests[0]!.approval_state,
+};
+
+const SET_VIEWED_FILE_RESPONSE = {
+  ...VIEWED_FILES_RESPONSE,
+  viewed_file: VIEWED_FILES_RESPONSE.viewed_files[0],
+  updated: true,
+};
+
+describe("useViewedFiles", () => {
+  it("GETs /change-requests/:id/viewed-files and uses reviewKeys.viewedFiles(id)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(VIEWED_FILES_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useViewedFiles("cr-1"), { wrapper: Wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual(VIEWED_FILES_RESPONSE);
+
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("change-requests/cr-1/viewed-files");
+    expect(call[1]?.method).toBe("GET");
+  });
+});
+
+describe("useSetViewedFile", () => {
+  it("PUTs to /change-requests/:id/viewed-files with an Idempotency-Key", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(SET_VIEWED_FILE_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useSetViewedFile(), { wrapper: Wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        id: "cr-1",
+        path: "/contracts/acme.md",
+        viewed: true,
+      });
+    });
+
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("change-requests/cr-1/viewed-files");
+    expect(call[1]?.method).toBe("PUT");
+    expect(headerOf(call[1], "Idempotency-Key")).toMatch(/^[0-9a-f-]{20,}$/i);
+    const body = String(call[1]?.body);
+    expect(body).toContain('"/contracts/acme.md"');
+    expect(body).toContain('"viewed":true');
+  });
+
+  it("invalidates viewed-files, detail, and list on success", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(SET_VIEWED_FILE_RESPONSE));
+    const { Wrapper, queryClient } = wrapAuthed(fetchSpy);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useSetViewedFile(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({
+        id: "cr-1",
+        path: "/contracts/acme.md",
+        viewed: true,
+      });
+    });
+    const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(calledKeys).toContainEqual(reviewKeys.viewedFiles("cr-1"));
+    expect(calledKeys).toContainEqual(reviewKeys.detail("cr-1"));
+    expect(calledKeys).toContainEqual(reviewKeys.list());
   });
 });

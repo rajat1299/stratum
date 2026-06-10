@@ -103,6 +103,48 @@ function buildCapabilitiesResponse(requireAllViewed = true): Response {
   });
 }
 
+interface ViewedFilesPayload {
+  readonly viewed_files?: readonly {
+    readonly change_request_id: string;
+    readonly head_commit: string;
+    readonly path: string;
+    readonly viewed_by: number;
+    readonly viewed: boolean;
+    readonly version: number;
+  }[];
+  readonly required_paths: readonly string[];
+  readonly unviewed_paths: readonly string[];
+  readonly all_required_files_viewed: boolean;
+  readonly require_all_files_viewed: boolean;
+  readonly approval_state?: ChangeRequestResponse["approval_state"];
+}
+
+function buildViewedFilesResponse(
+  overrides: Partial<ViewedFilesPayload> & Pick<ViewedFilesPayload, "required_paths" | "unviewed_paths">,
+): ViewedFilesPayload {
+  const required = overrides.required_paths;
+  const unviewed = overrides.unviewed_paths;
+  return {
+    viewed_files:
+      overrides.viewed_files ??
+      required
+        .filter((path) => !unviewed.includes(path))
+        .map((path) => ({
+          change_request_id: "cr-1",
+          head_commit: OPEN_PENDING.change_request.head_commit,
+          path,
+          viewed_by: 1,
+          viewed: true,
+          version: 1,
+        })),
+    required_paths: required,
+    unviewed_paths: unviewed,
+    all_required_files_viewed: overrides.all_required_files_viewed ?? unviewed.length === 0,
+    require_all_files_viewed: overrides.require_all_files_viewed ?? true,
+    approval_state: overrides.approval_state ?? OPEN_APPROVED.approval_state,
+  };
+}
+
 interface RenderOptions {
   readonly id?: string;
   readonly onBack?: () => void;
@@ -116,6 +158,11 @@ interface RenderOptions {
   readonly commentsResponse?: Response | (() => Response | Promise<Response>);
   /** Override the response for GET /vcs/diff?base=...&head=... (Phase C/D detail). */
   readonly diffResponse?: Response | typeof globalThis.fetch;
+  /** Override GET /change-requests/:id/viewed-files (Task 10.5). */
+  readonly viewedFilesResponse?:
+    | Response
+    | ViewedFilesPayload
+    | (() => Response | ViewedFilesPayload | Promise<Response | ViewedFilesPayload>);
 }
 
 const EMPTY_APPROVALS = () =>
@@ -143,8 +190,34 @@ const EMPTY_REVIEWERS = () =>
     },
   );
 
-const EMPTY_DIFF = () =>
+const EMPTY_DIFF: typeof globalThis.fetch = async () =>
   new Response("No changes.\n", {
+    status: 200,
+    headers: { "content-type": "text/plain" },
+  });
+
+const DEFAULT_VIEWED_FILES = () =>
+  okJson(
+    buildViewedFilesResponse({
+      required_paths: [],
+      unviewed_paths: [],
+      all_required_files_viewed: true,
+      require_all_files_viewed: false,
+    }),
+  );
+
+const ACME_DIFF_BODY = [
+  "diff -- /contracts/acme.md",
+  "--- a/contracts/acme.md",
+  "+++ b/contracts/acme.md",
+  "@@ -1,1 +1,1 @@",
+  "-old cap",
+  "+new cap",
+  "",
+].join("\n");
+
+const ACME_DIFF: typeof globalThis.fetch = async () =>
+  new Response(ACME_DIFF_BODY, {
     status: 200,
     headers: { "content-type": "text/plain" },
   });
@@ -161,6 +234,7 @@ function renderDetail(
     reviewersResponse,
     commentsResponse,
     diffResponse,
+    viewedFilesResponse,
   } = opts;
 
   // URL-aware fetch:
@@ -193,11 +267,26 @@ function renderDetail(
       : async () => (diffResponse instanceof Response ? diffResponse.clone() : diffResponse)
     : EMPTY_DIFF;
 
+  const viewedFilesFn = viewedFilesResponse
+    ? typeof viewedFilesResponse === "function"
+      ? viewedFilesResponse
+      : async () => {
+          if (viewedFilesResponse instanceof Response) return viewedFilesResponse.clone();
+          return okJson(viewedFilesResponse);
+        }
+    : DEFAULT_VIEWED_FILES;
+
   globalThis.fetch = (async (input, init) => {
     const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
     const method = (init?.method ?? "GET").toUpperCase();
     if (url.includes("/v1/capabilities")) return buildCapabilitiesResponse(requireAllViewed);
     if (method === "GET" && url.includes("/vcs/diff")) return diffFn(input, init);
+    if (method === "GET" && url.includes("/viewed-files")) {
+      const result = await viewedFilesFn();
+      if (result instanceof Response) return result;
+      return okJson(result);
+    }
+    if (method === "PUT" && url.includes("/viewed-files")) return primaryFn(input, init);
     // Only GET /approvals (list query) gets the empty-list stub.
     // POST /approvals (approve / dismiss mutations) routes to `primary`
     // so existing mutation tests' stubs still drive that response.
@@ -369,16 +458,6 @@ describe("ChangeRequestDetail — action row (D3 wired)", () => {
     expect(merge.title).toMatch(/waiting for 1 approval/i);
     const requestChanges = screen.getByRole("button", { name: /request changes/i }) as HTMLButtonElement;
     expect(requestChanges.disabled).toBe(false);
-  });
-
-  it("on an approved CR that requires all files viewed: Merge is gated by the CR response", async () => {
-    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
-      requireAllViewed: false,
-    });
-    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
-    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
-    expect(merge.disabled).toBe(true);
-    expect(merge.title).toMatch(/review every changed file/i);
   });
 
   it("on an approved CR with CR-level file viewing disabled: Merge is enabled and explains the exact advance", async () => {
@@ -869,6 +948,155 @@ describe("ChangeRequestDetail — merge/reject confirmations", () => {
     await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
     expect(screen.queryByRole("button", { name: /^confirm merge$/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /^confirm reject$/i })).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 10.5 — viewed-file merge gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("ChangeRequestDetail — viewed-file merge gate", () => {
+  it("when require_all_files_viewed is true and viewed-files query is loading, merge is disabled with Loading file review state.", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      viewedFilesResponse: () => new Promise<Response>(() => undefined),
+      diffResponse: ACME_DIFF,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+    expect(merge.title).toMatch(/loading file review state/i);
+  });
+
+  it("when viewed-files query errors, merge is disabled with Couldn't load file review state.", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      viewedFilesResponse: httpError(403, { error: "viewed forbidden" }),
+      diffResponse: ACME_DIFF,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    await waitFor(() => {
+      const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+      expect(merge.disabled).toBe(true);
+      expect(merge.title).toMatch(/couldn't load file review state/i);
+    });
+  });
+
+  it("when one required path is unviewed, merge is disabled and copy says Review 1 remaining file before merging.", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      viewedFilesResponse: buildViewedFilesResponse({
+        required_paths: ["/contracts/acme.md"],
+        unviewed_paths: ["/contracts/acme.md"],
+        all_required_files_viewed: false,
+      }),
+      diffResponse: ACME_DIFF,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+    expect(merge.title).toMatch(/review 1 remaining file before merging/i);
+    expect(screen.getByText(/Review 1 remaining file before merging/i)).toBeTruthy();
+  });
+
+  it("checking a file calls setViewedFile for that path", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/viewed-files") && init?.method === "PUT") {
+        return okJson({
+          ...buildViewedFilesResponse({
+            required_paths: ["/contracts/acme.md"],
+            unviewed_paths: [],
+          }),
+          viewed_file: {
+            change_request_id: "cr-1",
+            head_commit: OPEN_APPROVED.change_request.head_commit,
+            path: "/contracts/acme.md",
+            viewed_by: 1,
+            viewed: true,
+            version: 1,
+          },
+          updated: true,
+        });
+      }
+      return okJson(OPEN_APPROVED);
+    });
+    renderDetail(detailFetch, {
+      viewedFilesResponse: buildViewedFilesResponse({
+        required_paths: ["/contracts/acme.md"],
+        unviewed_paths: ["/contracts/acme.md"],
+        all_required_files_viewed: false,
+      }),
+      diffResponse: ACME_DIFF,
+    });
+    await screen.findByText("/contracts/acme.md");
+    const checkbox = screen.getByRole("checkbox", { name: /^viewed$/i });
+    await act(async () => {
+      fireEvent.click(checkbox);
+    });
+    await waitFor(() => {
+      const putCall = detailFetch.mock.calls.find(
+        ([u, i]) => String(u).includes("/viewed-files") && i?.method === "PUT",
+      );
+      expect(putCall).toBeTruthy();
+      expect(String(putCall?.[1]?.body)).toContain('"/contracts/acme.md"');
+      expect(String(putCall?.[1]?.body)).toContain('"viewed":true');
+    });
+  });
+
+  it("after all required paths are viewed, merge button can open the confirmation flow", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      viewedFilesResponse: buildViewedFilesResponse({
+        required_paths: ["/contracts/acme.md"],
+        unviewed_paths: [],
+      }),
+      diffResponse: ACME_DIFF,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(false);
+    fireEvent.click(merge);
+    expect(screen.getByRole("button", { name: /^confirm merge$/i })).toBeTruthy();
+  });
+
+  it("when require_all_files_viewed is false, merge is not blocked by unviewed paths", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED_READY)), {
+      viewedFilesResponse: buildViewedFilesResponse({
+        required_paths: ["/contracts/acme.md"],
+        unviewed_paths: ["/contracts/acme.md"],
+        all_required_files_viewed: false,
+        require_all_files_viewed: false,
+        approval_state: OPEN_APPROVED_READY.approval_state,
+      }),
+      diffResponse: ACME_DIFF,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(false);
+  });
+
+  it("the diff section shows 0 of N files viewed and updates based on backend response", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      viewedFilesResponse: buildViewedFilesResponse({
+        required_paths: ["/contracts/acme.md", "/runbooks/policy.md"],
+        unviewed_paths: ["/contracts/acme.md", "/runbooks/policy.md"],
+        all_required_files_viewed: false,
+      }),
+      diffResponse: ACME_DIFF,
+    });
+    expect(await screen.findByText("0 of 2 files viewed")).toBeTruthy();
+  });
+
+  it("empty diff with required_paths: [] shows all viewed and does not block merge", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      viewedFilesResponse: buildViewedFilesResponse({
+        required_paths: [],
+        unviewed_paths: [],
+        all_required_files_viewed: true,
+      }),
+      diffResponse: EMPTY_DIFF,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    expect(screen.getByText("0 of 0 files viewed")).toBeTruthy();
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(false);
   });
 });
 

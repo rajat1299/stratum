@@ -16,9 +16,11 @@ import type {
   ChangeRequestResponse,
   ReviewComment,
   ReviewerAssignment,
+  ViewedFilesResponse,
 } from "@stratum/sdk";
+import type { UseQueryResult } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { DiffViewer } from "./DiffViewer.tsx";
+import { DiffFragmentBody } from "./DiffViewer.tsx";
 import {
   useApprovals,
   useApproveChangeRequest,
@@ -32,8 +34,15 @@ import {
   useAssignReviewer,
   useReviewers,
   useRevertChangeRequest,
+  useSetViewedFile,
+  useViewedFiles,
 } from "../lib/api/reviews.ts";
-import { parseDiff } from "../lib/diff-parser.ts";
+import {
+  fragmentTotals,
+  parseDiff,
+  summariseFragmentKind,
+  type DiffFragment,
+} from "../lib/diff-parser.ts";
 import { formatReviewActor, formatReviewActorList } from "../lib/review-actors.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +83,7 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
   const cr = item.change_request;
   const approval = item.approval_state;
   const approved = "approved" in approval && approval.approved;
+  const viewedFiles = useViewedFiles(cr.id);
   const [commentComposer, setCommentComposer] = useState<CommentComposerState>({
     open: false,
     kind: "general",
@@ -104,6 +114,7 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
 
       <ActionRow
         item={item}
+        viewedFiles={viewedFiles}
         onRequestChanges={() => setCommentComposer({ open: true, kind: "changes_requested" })}
       />
 
@@ -132,7 +143,7 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
         onComposerChange={setCommentComposer}
       />
 
-      <DiffSection cr={cr} />
+      <DiffSection cr={cr} viewedFiles={viewedFiles} />
     </article>
   );
 }
@@ -143,9 +154,11 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
 
 function ActionRow({
   item,
+  viewedFiles,
   onRequestChanges,
 }: {
   readonly item: ChangeRequestResponse;
+  readonly viewedFiles: UseQueryResult<ViewedFilesResponse, Error>;
   readonly onRequestChanges: () => void;
 }) {
   const cr = item.change_request;
@@ -162,13 +175,10 @@ function ActionRow({
   const [showMergeConfirm, setShowMergeConfirm] = useState(false);
   const [showRejectConfirm, setShowRejectConfirm] = useState(false);
 
-  const mergeBlockedByViewing = approved && item.require_all_files_viewed;
-  const canMerge = approved && !mergeBlockedByViewing && !isTerminal;
-  const mergeBlockedReason = mergeBlockReason({
-    approval,
-    approved,
-    mergeBlockedByViewing,
-  });
+  const fileGate = fileReviewGate(item, viewedFiles);
+  const canMerge = approved && !isTerminal && !fileGate.blocksMerge;
+  const mergeBlockedReason =
+    mergeBlockReason({ approval, approved }) ?? fileGate.reason;
 
   const anyPending = approve.isPending || reject.isPending || merge.isPending || revert.isPending;
   const firstError = approve.error ?? reject.error ?? merge.error ?? revert.error;
@@ -371,13 +381,10 @@ function ActionRow({
 function mergeBlockReason({
   approval,
   approved,
-  mergeBlockedByViewing,
 }: {
   readonly approval: ChangeRequestResponse["approval_state"];
   readonly approved: boolean;
-  readonly mergeBlockedByViewing: boolean;
 }): string | undefined {
-  if (mergeBlockedByViewing) return "Review every changed file before merging.";
   if (approved) return undefined;
   if (!("approved" in approval)) return "Approval status is unavailable.";
 
@@ -390,6 +397,57 @@ function mergeBlockReason({
   if (missing > 0) return `Waiting for ${missing} approval${missing === 1 ? "" : "s"}.`;
 
   return "Waiting for approval.";
+}
+
+function fileReviewGate(
+  item: ChangeRequestResponse,
+  viewedFiles: UseQueryResult<ViewedFilesResponse, Error>,
+): {
+  readonly blocksMerge: boolean;
+  readonly reason?: string;
+  readonly allViewed: boolean;
+  readonly unviewedCount: number;
+} {
+  const requiresViewing = (() => {
+    const approval = item.approval_state;
+    if ("approved" in approval) return approval.require_all_files_viewed;
+    return item.require_all_files_viewed;
+  })();
+
+  if (!requiresViewing) {
+    return { blocksMerge: false, allViewed: true, unviewedCount: 0 };
+  }
+
+  if (viewedFiles.isLoading) {
+    return {
+      blocksMerge: true,
+      reason: "Loading file review state.",
+      allViewed: false,
+      unviewedCount: 0,
+    };
+  }
+
+  if (viewedFiles.isError) {
+    return {
+      blocksMerge: true,
+      reason: "Couldn't load file review state.",
+      allViewed: false,
+      unviewedCount: 0,
+    };
+  }
+
+  const unviewedCount = viewedFiles.data?.unviewed_paths.length ?? 0;
+  if (unviewedCount > 0) {
+    const fileWord = unviewedCount === 1 ? "file" : "files";
+    return {
+      blocksMerge: true,
+      reason: `Review ${unviewedCount} remaining ${fileWord} before merging.`,
+      allViewed: false,
+      unviewedCount,
+    };
+  }
+
+  return { blocksMerge: false, allViewed: true, unviewedCount: 0 };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1039,9 +1097,38 @@ function Row({ k, children }: { readonly k: string; readonly children: React.Rea
 // Diff
 // ─────────────────────────────────────────────────────────────────────────────
 
-function DiffSection({ cr }: { readonly cr: ChangeRequest }) {
+function DiffSection({
+  cr,
+  viewedFiles,
+}: {
+  readonly cr: ChangeRequest;
+  readonly viewedFiles: UseQueryResult<ViewedFilesResponse, Error>;
+}) {
   const q = useChangeRequestDiff(cr);
+  const setViewed = useSetViewedFile();
   const parsed = useMemo(() => (q.data !== undefined ? parseDiff(q.data) : null), [q.data]);
+  const isTerminal = cr.status !== "open";
+  const requiredPaths = viewedFiles.data?.required_paths ?? [];
+  const unviewedPaths = viewedFiles.data?.unviewed_paths ?? [];
+  const viewedCount = Math.max(requiredPaths.length - unviewedPaths.length, 0);
+  const allViewed = requiredPaths.length === 0 || unviewedPaths.length === 0;
+  const markAllDisabled =
+    isTerminal || viewedFiles.isLoading || viewedFiles.isError || setViewed.isPending;
+
+  function isPathViewed(path: string): boolean {
+    return !unviewedPaths.includes(path);
+  }
+
+  function togglePath(path: string, viewed: boolean) {
+    setViewed.mutate({ id: cr.id, path, viewed });
+  }
+
+  function markAll(viewed: boolean) {
+    const targets = viewed ? unviewedPaths : requiredPaths.filter((path) => isPathViewed(path));
+    for (const path of targets) {
+      setViewed.mutate({ id: cr.id, path, viewed });
+    }
+  }
 
   return (
     <section aria-labelledby="cr-detail-diff" className="mt-8">
@@ -1058,6 +1145,24 @@ function DiffSection({ cr }: { readonly cr: ChangeRequest }) {
         </span>
         <span title={cr.head_commit}>head {shortHash(cr.head_commit)}</span>
       </div>
+
+      {viewedFiles.isSuccess && (
+        <div className="mb-3 flex flex-wrap items-center gap-3">
+          <span className="font-mono text-[11.5px] tabular-nums text-stone-600">
+            {viewedCount} of {requiredPaths.length} files viewed
+          </span>
+          {!isTerminal && (
+            <button
+              type="button"
+              onClick={() => markAll(!allViewed)}
+              disabled={markAllDisabled || requiredPaths.length === 0}
+              className="rounded-md border border-stone-300 px-2 py-0.5 font-mono text-[10.5px] text-stone-600 transition enabled:hover:border-stone-500 enabled:hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {allViewed ? "Unmark all" : "Mark all viewed"}
+            </button>
+          )}
+        </div>
+      )}
 
       {q.isLoading && (
         <div
@@ -1087,8 +1192,109 @@ function DiffSection({ cr }: { readonly cr: ChangeRequest }) {
         </div>
       )}
 
-      {q.isSuccess && parsed !== null && (
-        <DiffViewer fragments={parsed.fragments} isEmpty={parsed.isEmpty} />
+      {q.isSuccess && parsed !== null && parsed.isEmpty && (
+        <div className="rounded-md border border-dashed border-stone-300 bg-stone-50 px-6 py-12 text-center text-stone-500">
+          <p className="font-serif italic">No changes between these refs.</p>
+        </div>
+      )}
+
+      {q.isSuccess && parsed !== null && !parsed.isEmpty && (
+        <div className="flex flex-col gap-3">
+          {parsed.fragments.map((fragment) => (
+            <ReviewedFileCard
+              key={fragment.path}
+              crId={cr.id}
+              fragment={fragment}
+              viewed={isPathViewed(fragment.path)}
+              checkboxDisabled={
+                isTerminal ||
+                viewedFiles.isLoading ||
+                viewedFiles.isError ||
+                (setViewed.isPending && setViewed.variables?.path === fragment.path)
+              }
+              onToggle={(viewed) => togglePath(fragment.path, viewed)}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ReviewedFileCard({
+  crId,
+  fragment,
+  viewed,
+  checkboxDisabled,
+  onToggle,
+}: {
+  readonly crId: string;
+  readonly fragment: DiffFragment;
+  readonly viewed: boolean;
+  readonly checkboxDisabled: boolean;
+  readonly onToggle: (viewed: boolean) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const { added, removed } = fragmentTotals(fragment);
+  const kindLabel = summariseFragmentKind(fragment.kind);
+
+  return (
+    <section
+      aria-labelledby={`cr-diff-${crId}-${fragment.path}`}
+      className={`overflow-hidden rounded-md border bg-white shadow-sm ${
+        viewed ? "border-stone-100 opacity-80" : "border-stone-200"
+      }`}
+    >
+      <header className="flex items-center gap-3 border-b border-stone-100 bg-stone-50 px-3 py-2">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-controls={`cr-diff-body-${crId}-${fragment.path}`}
+          className="rounded-sm px-1 py-0.5 text-stone-500 hover:bg-stone-200"
+        >
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 16 16"
+            aria-hidden
+            style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 160ms ease" }}
+          >
+            <path d="M6 3l5 5-5 5" stroke="currentColor" strokeWidth={1.5} fill="none" strokeLinecap="round" />
+          </svg>
+        </button>
+        <h3
+          id={`cr-diff-${crId}-${fragment.path}`}
+          className={`min-w-0 flex-1 truncate font-mono text-[12.5px] ${
+            viewed ? "text-stone-500 line-through decoration-stone-300" : "text-stone-900"
+          }`}
+        >
+          {fragment.path}
+        </h3>
+        {fragment.kind === "text-unified" && (
+          <span className="font-mono text-[11px] tabular-nums">
+            <span className="text-emerald-700">+{added}</span>{" "}
+            <span className="text-rose-700">−{removed}</span>
+          </span>
+        )}
+        <span className="font-mono text-[10px] uppercase tracking-wider text-stone-500">
+          {kindLabel}
+        </span>
+        <label className="flex items-center gap-1.5 rounded-md border border-stone-200 bg-white px-2 py-0.5 text-[11.5px] text-stone-600">
+          <input
+            type="checkbox"
+            checked={viewed}
+            disabled={checkboxDisabled}
+            onChange={(e) => onToggle(e.currentTarget.checked)}
+            className="h-3 w-3 accent-emerald-600 disabled:cursor-not-allowed disabled:opacity-40"
+          />
+          Viewed
+        </label>
+      </header>
+      {open && (
+        <div id={`cr-diff-body-${crId}-${fragment.path}`}>
+          <DiffFragmentBody fragment={fragment} />
+        </div>
       )}
     </section>
   );
