@@ -67,7 +67,9 @@ const FILE_EXTRACTORS_SQL: &str =
     include_str!("../../migrations/postgres/0021_file_extractors.sql");
 const POSTGRES_MIGRATION_0022_PGVECTOR_SEMANTIC_EXPANSION: &str =
     include_str!("../../migrations/postgres/0022_pgvector_semantic_expansion.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 22] = [
+const POSTGRES_MIGRATION_0023_REVIEW_VIEWED_FILES: &str =
+    include_str!("../../migrations/postgres/0023_review_viewed_files.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 23] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -177,6 +179,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 22] = [
         version: 22,
         name: "pgvector_semantic_expansion",
         sql: POSTGRES_MIGRATION_0022_PGVECTOR_SEMANTIC_EXPANSION,
+    },
+    PostgresMigration {
+        version: 23,
+        name: "review_viewed_files",
+        sql: POSTGRES_MIGRATION_0023_REVIEW_VIEWED_FILES,
     },
 ];
 
@@ -734,6 +741,7 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         "approvals",
         "review_comments",
         "reviewer_assignments",
+        "change_request_file_views",
         "durable_post_cas_recovery_claims",
         "durable_pre_visibility_recovery_ledger",
         "durable_fs_mutation_recovery_ledger",
@@ -5065,6 +5073,9 @@ async fn require_control_plane_readiness_shape(
              LIMIT 0;
              SELECT id, change_request_id, author, body, path, kind, active, version, created_at
              FROM review_comments
+             LIMIT 0;
+             SELECT change_request_id, head_commit, path, viewed_by, viewed, version, created_at, updated_at
+             FROM change_request_file_views
              LIMIT 0;",
         )
         .await
@@ -5537,7 +5548,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 23);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -5585,7 +5596,7 @@ mod tests {
     fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
         let migration = migration_by_version(17).expect("SAML SSO migration is registered");
         assert_eq!(migration.name, "saml_sso_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 23);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS saml_providers",
@@ -5643,7 +5654,7 @@ mod tests {
         let migration =
             migration_by_version(18).expect("SCIM provisioning migration is registered");
         assert_eq!(migration.name, "scim_provisioning_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 23);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS scim_clients",
@@ -7331,7 +7342,7 @@ mod tests {
 
     #[test]
     fn postgres_fts_search_mvp_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 22);
+        assert_eq!(postgres_migration_catalog_len(), 23);
         let m19 = migration_by_version(19).expect("migration 19 registered");
         assert_eq!(m19.name, "postgres_fts_search_mvp");
         let sql = m19.sql.to_uppercase();
@@ -7343,7 +7354,7 @@ mod tests {
 
     #[test]
     fn file_extractors_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 22);
+        assert_eq!(postgres_migration_catalog_len(), 23);
         let m21 = migration_by_version(21).expect("migration 21 registered");
         assert_eq!(m21.name, "file_extractors");
         let m20 = migration_by_version(20).expect("migration 20 registered");
@@ -7357,7 +7368,7 @@ mod tests {
 
     #[test]
     fn acl_snapshot_filtering_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 22);
+        assert_eq!(postgres_migration_catalog_len(), 23);
         let m20 = migration_by_version(20).expect("migration 20 registered");
         assert_eq!(m20.name, "acl_snapshot_filtering");
         let m19 = migration_by_version(19).expect("migration 19 registered");
@@ -7372,7 +7383,7 @@ mod tests {
 
     #[test]
     fn pgvector_semantic_expansion_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 22);
+        assert_eq!(postgres_migration_catalog_len(), 23);
         let m22 = migration_by_version(22).expect("migration 22 registered");
         assert_eq!(m22.name, "pgvector_semantic_expansion");
         let m21 = migration_by_version(21).expect("migration 21 registered");
@@ -7426,6 +7437,44 @@ mod tests {
             !sql.contains("CHUNK_TEXT"),
             "vector tables must not store raw chunk text"
         );
+    }
+
+    #[test]
+    fn review_viewed_files_migration_is_registered_and_non_destructive() {
+        assert_eq!(postgres_migration_catalog_len(), 23);
+        let m23 = migration_by_version(23).expect("migration 23 registered");
+        assert_eq!(m23.name, "review_viewed_files");
+        let m22 = migration_by_version(22).expect("migration 22 registered");
+        assert_eq!(m22.name, "pgvector_semantic_expansion");
+
+        let idx23 = POSTGRES_MIGRATIONS
+            .iter()
+            .position(|m| m.version == 23)
+            .expect("migration 23 present");
+        let idx22 = POSTGRES_MIGRATIONS
+            .iter()
+            .position(|m| m.version == 22)
+            .expect("migration 22 present");
+        assert!(
+            idx23 > idx22,
+            "migration 23 must follow pgvector_semantic_expansion"
+        );
+
+        let sql = m23.sql.to_uppercase();
+        assert!(sql.contains("CREATE TABLE CHANGE_REQUEST_FILE_VIEWS"));
+        assert!(sql.contains("CHANGE_REQUEST_FILE_VIEWS_CHANGE_HEAD_IDX"));
+        assert!(sql.contains("REFERENCES CHANGE_REQUESTS(ID)"));
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(!sql.contains("DROP COLUMN"));
+    }
+
+    #[tokio::test]
+    async fn known_schema_verifier_requires_change_request_file_views_table() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.runner().adopt_applied().await.expect("adopt schema");
+        db.cleanup().await;
     }
 
     #[tokio::test]

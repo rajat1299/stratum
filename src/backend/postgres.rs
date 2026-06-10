@@ -91,6 +91,7 @@ use crate::review::{
     ChangeRequest, ChangeRequestStatus, DismissApprovalInput, NewApprovalRecord, NewChangeRequest,
     NewReviewAssignment, NewReviewComment, ProtectedPathRule, ProtectedRefRule, ReviewAssignment,
     ReviewAssignmentMutation, ReviewComment, ReviewCommentKind, ReviewCommentMutation, ReviewStore,
+    SetViewedFileInput, ViewedFileMutation, ViewedFileRecord, normalize_path_prefix,
     normalize_dismissal_reason, validate_change_request_open,
 };
 use crate::store::{ObjectId, ObjectKind};
@@ -8072,6 +8073,32 @@ fn row_to_review_comment(row: Row, change: &ChangeRequest) -> Result<ReviewComme
     Ok(record)
 }
 
+fn row_to_viewed_file_record(
+    row: Row,
+    change: &ChangeRequest,
+) -> Result<ViewedFileRecord, VfsError> {
+    let record = ViewedFileRecord {
+        change_request_id: row.get("change_request_id"),
+        head_commit: row.get("head_commit"),
+        path: row.get("path"),
+        viewed_by: i32_to_uid(row.get("viewed_by"))?,
+        viewed: row.get("viewed"),
+        version: positive_i64_to_u64(row.get("version"), "viewed file")?,
+    };
+    record.validate(change).map_err(corrupt_from_invalid)?;
+    Ok(record)
+}
+
+fn normalize_viewed_file_path_for_postgres(path: &str) -> Result<String, VfsError> {
+    let path = path.trim();
+    if path.is_empty() || path == "/" || !path.starts_with('/') {
+        return Err(VfsError::InvalidPath {
+            path: path.to_string(),
+        });
+    }
+    normalize_path_prefix(path)
+}
+
 async fn load_review_change_request<C>(
     client: &C,
     repo_id: &RepoId,
@@ -9006,6 +9033,159 @@ impl ReviewStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("review decision commit", error))?;
         Ok(Some(decision))
+    }
+
+    async fn set_viewed_file_for_repo(
+        &self,
+        repo_id: &RepoId,
+        input: SetViewedFileInput,
+    ) -> Result<ViewedFileMutation, VfsError> {
+        let path = normalize_viewed_file_path_for_postgres(&input.path)?;
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("review viewed file transaction", error))?;
+        let change_row = tx
+            .query_opt(
+                r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
+                          head_commit, status, created_by, version
+                   FROM change_requests
+                   WHERE repo_id = $1 AND id = $2
+                   FOR UPDATE"#,
+                &[&repo_id.as_str(), &input.change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review viewed file lock change request", error))?;
+        let Some(change_row) = change_row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review viewed file rollback", error))?;
+            return Err(VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            });
+        };
+        let change = row_to_change_request(change_row)?;
+        validate_change_request_open(&change)?;
+        let viewed_by_db = uid_to_i32(input.viewed_by)?;
+        let head_commit = change.head_commit.clone();
+
+        let inserted = tx
+            .query_opt(
+                r#"INSERT INTO change_request_file_views (
+                       change_request_id, head_commit, path, viewed_by, viewed, version
+                   )
+                   VALUES ($1, $2, $3, $4, $5, 1)
+                   ON CONFLICT (change_request_id, head_commit, path, viewed_by) DO NOTHING
+                   RETURNING change_request_id, head_commit, path, viewed_by, viewed, version"#,
+                &[
+                    &input.change_request_id,
+                    &head_commit,
+                    &path,
+                    &viewed_by_db,
+                    &input.viewed,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review viewed file insert", error))?;
+        if let Some(row) = inserted {
+            let record = row_to_viewed_file_record(row, &change)?;
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("review viewed file commit", error))?;
+            return Ok(ViewedFileMutation {
+                record,
+                created: true,
+                updated: false,
+            });
+        }
+
+        let existing_row = tx
+            .query_one(
+                r#"SELECT change_request_id, head_commit, path, viewed_by, viewed, version
+                   FROM change_request_file_views
+                   WHERE change_request_id = $1 AND head_commit = $2 AND path = $3 AND viewed_by = $4"#,
+                &[
+                    &input.change_request_id,
+                    &head_commit,
+                    &path,
+                    &viewed_by_db,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review viewed file load duplicate", error))?;
+        let existing = row_to_viewed_file_record(existing_row, &change)?;
+        if existing.viewed == input.viewed {
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("review viewed file commit", error))?;
+            return Ok(ViewedFileMutation {
+                record: existing,
+                created: false,
+                updated: false,
+            });
+        }
+
+        let next_version = existing
+            .version
+            .checked_add(1)
+            .ok_or_else(|| VfsError::InvalidArgs {
+                message: "viewed file version overflow".to_string(),
+            })?;
+        let next_version_i64 = u64_to_i64(next_version, "viewed file version")?;
+        let updated_row = tx
+            .query_one(
+                r#"UPDATE change_request_file_views
+                   SET viewed = $5, version = $6, updated_at = now()
+                   WHERE change_request_id = $1 AND head_commit = $2 AND path = $3 AND viewed_by = $4
+                   RETURNING change_request_id, head_commit, path, viewed_by, viewed, version"#,
+                &[
+                    &input.change_request_id,
+                    &head_commit,
+                    &path,
+                    &viewed_by_db,
+                    &input.viewed,
+                    &next_version_i64,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review viewed file update", error))?;
+        let record = row_to_viewed_file_record(updated_row, &change)?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("review viewed file commit", error))?;
+        Ok(ViewedFileMutation {
+            record,
+            created: false,
+            updated: true,
+        })
+    }
+
+    async fn list_viewed_files_for_repo(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+        viewed_by: Uid,
+    ) -> Result<Vec<ViewedFileRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let Some(change) = load_review_change_request(&client, repo_id, change_request_id).await?
+        else {
+            return Ok(vec![]);
+        };
+        let viewed_by_db = uid_to_i32(viewed_by)?;
+        let rows = client
+            .query(
+                r#"SELECT change_request_id, head_commit, path, viewed_by, viewed, version
+                   FROM change_request_file_views
+                   WHERE change_request_id = $1 AND head_commit = $2 AND viewed_by = $3
+                   ORDER BY path ASC"#,
+                &[&change_request_id, &change.head_commit, &viewed_by_db],
+            )
+            .await
+            .map_err(|error| postgres_error("review viewed file list", error))?;
+        rows.into_iter()
+            .map(|row| row_to_viewed_file_record(row, &change))
+            .collect()
     }
 }
 
@@ -10953,6 +11133,7 @@ mod tests {
     use crate::review::{
         ApprovalRecordMutation, ChangeRequestStatus, DismissApprovalInput, NewApprovalRecord,
         NewChangeRequest, NewReviewAssignment, NewReviewComment, ReviewCommentKind, ReviewStore,
+        SetViewedFileInput,
     };
     use crate::vcs::{ChangeKind, MAIN_REF, PathKind, PathRecord};
     use crate::workspace::WorkspaceMetadataStore;
@@ -11448,6 +11629,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply pgvector semantic expansion migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0023_review_viewed_files.sql"
+                ))
+                .await
+                .expect("apply review viewed files migration");
 
             let posture = DurablePostgresRuntimePosture::for_test(
                 32,
@@ -18066,5 +18253,191 @@ mod tests {
         assert_eq!(results[0].path, "/allowed.md");
 
         db.cleanup().await;
+    }
+
+    mod postgres_review_viewed_files {
+        use super::*;
+
+        fn postgres_viewed_file_change_request(created_by: Uid) -> NewChangeRequest {
+            NewChangeRequest {
+                title: "Viewed file review".to_string(),
+                description: None,
+                source_ref: "review/viewed-files".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: "a".repeat(64),
+                head_commit: "b".repeat(64),
+                created_by,
+            }
+        }
+
+        #[tokio::test]
+        async fn postgres_viewed_files_create_and_list() {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            let store = &db.store;
+            let change = ReviewStore::create_change_request(
+                store,
+                postgres_viewed_file_change_request(10),
+            )
+            .await
+            .expect("create change request");
+
+            let mutation = ReviewStore::set_viewed_file(
+                store,
+                SetViewedFileInput {
+                    change_request_id: change.id,
+                    path: "/contracts/a.md".to_string(),
+                    viewed_by: 42,
+                    viewed: true,
+                },
+            )
+            .await
+            .expect("set viewed file");
+            assert!(mutation.created);
+            assert!(!mutation.updated);
+            assert_eq!(mutation.record.version, 1);
+            assert_eq!(mutation.record.path, "/contracts/a.md");
+            assert_eq!(mutation.record.head_commit, change.head_commit);
+
+            let listed = ReviewStore::list_viewed_files(store, change.id, 42)
+                .await
+                .expect("list viewed files");
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].path, "/contracts/a.md");
+            assert!(listed[0].viewed);
+
+            db.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn postgres_viewed_files_idempotent_same_value() {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            let store = &db.store;
+            let change = ReviewStore::create_change_request(
+                store,
+                postgres_viewed_file_change_request(10),
+            )
+            .await
+            .expect("create change request");
+            let input = SetViewedFileInput {
+                change_request_id: change.id,
+                path: "/contracts/a.md".to_string(),
+                viewed_by: 42,
+                viewed: true,
+            };
+
+            let first = ReviewStore::set_viewed_file(store, input.clone())
+                .await
+                .expect("first set viewed file");
+            assert!(first.created);
+            assert!(!first.updated);
+
+            let second = ReviewStore::set_viewed_file(store, input)
+                .await
+                .expect("second set viewed file");
+            assert!(!second.created);
+            assert!(!second.updated);
+            assert_eq!(second.record.version, 1);
+
+            db.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn postgres_viewed_files_toggle_increments_version() {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            let store = &db.store;
+            let change = ReviewStore::create_change_request(
+                store,
+                postgres_viewed_file_change_request(10),
+            )
+            .await
+            .expect("create change request");
+
+            ReviewStore::set_viewed_file(
+                store,
+                SetViewedFileInput {
+                    change_request_id: change.id,
+                    path: "/contracts/a.md".to_string(),
+                    viewed_by: 42,
+                    viewed: true,
+                },
+            )
+            .await
+            .expect("mark viewed");
+
+            let mutation = ReviewStore::set_viewed_file(
+                store,
+                SetViewedFileInput {
+                    change_request_id: change.id,
+                    path: "/contracts/a.md".to_string(),
+                    viewed_by: 42,
+                    viewed: false,
+                },
+            )
+            .await
+            .expect("mark unviewed");
+            assert!(!mutation.created);
+            assert!(mutation.updated);
+            assert_eq!(mutation.record.version, 2);
+            assert!(!mutation.record.viewed);
+
+            db.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn postgres_viewed_files_are_repo_scoped() {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            let store = &db.store;
+            let repo_a = RepoId::local();
+            let repo_b = RepoId::new("repo_b").expect("repo b");
+            let change = ReviewStore::create_change_request_for_repo(
+                store,
+                &repo_a,
+                postgres_viewed_file_change_request(10),
+            )
+            .await
+            .expect("create change request");
+
+            ReviewStore::set_viewed_file_for_repo(
+                store,
+                &repo_a,
+                SetViewedFileInput {
+                    change_request_id: change.id,
+                    path: "/contracts/a.md".to_string(),
+                    viewed_by: 42,
+                    viewed: true,
+                },
+            )
+            .await
+            .expect("set viewed file");
+
+            let actor_records =
+                ReviewStore::list_viewed_files_for_repo(store, &repo_a, change.id, 42)
+                    .await
+                    .expect("list repo a");
+            assert_eq!(actor_records.len(), 1);
+
+            assert!(
+                ReviewStore::list_viewed_files_for_repo(store, &repo_b, change.id, 42)
+                    .await
+                    .expect("list repo b")
+                    .is_empty()
+            );
+            assert!(
+                ReviewStore::list_viewed_files_for_repo(store, &repo_a, change.id, 43)
+                    .await
+                    .expect("list other actor")
+                    .is_empty()
+            );
+
+            db.cleanup().await;
+        }
     }
 }
