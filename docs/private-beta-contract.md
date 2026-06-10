@@ -102,8 +102,13 @@ inspect history, and revert.
 The private-beta golden path extends that local route surface with the existing
 change-request and audit routes: create a workspace, issue a scoped workspace
 token, edit files through that token, open a change request from the session
-ref to the target ref, inspect the diff, comment, approve or reject, merge when
-requirements pass, view audit events, and revert if needed. Local seeding is
+ref to the target ref, inspect the diff, mark changed files as viewed, comment,
+approve or reject, merge when requirements pass (including the viewed-file gate
+when the matched protection policy requires it), view audit events, and revert
+if needed. The reviewer console reads and writes viewed-file state through the
+review HTTP routes; merge is blocked only when the effective policy requires all
+changed files to be viewed and the current authenticated actor still has unviewed
+required paths. Local seeding is
 packaged as the local-state-only `stratumctl workspace seed-demo`, which writes
 the issued workspace token to a chmod-600 env file and prints safe next commands
 without leaking secrets.

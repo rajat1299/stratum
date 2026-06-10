@@ -171,6 +171,7 @@ Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clie
 - `POST /change-requests/{id}/approvals`
 - `POST /change-requests/{id}/reviewers`
 - `POST /change-requests/{id}/comments`
+- `PUT /change-requests/{id}/viewed-files`
 - `POST /change-requests/{id}/reject`
 - `POST /change-requests/{id}/merge`
 - `POST /change-requests/{id}/approvals/{approval_id}/dismiss`
@@ -1357,7 +1358,7 @@ curl -X POST http://localhost:3000/protected/paths \
   }'
 ```
 
-`target_ref` is optional. `require_all_files_viewed` is optional on protected ref and path rules, defaults to `true`, and is returned by create/list APIs. This slice only persists and advertises the policy flag; it does not add file-view tracking or backend approval enforcement for that flag. Path prefixes are absolute, normalized boundaries. Direct filesystem enforcement evaluates these rules against resolved backing paths after workspace mount resolution; client responses still use projected paths and do not expose backing workspace paths beyond existing route behavior.
+`target_ref` is optional. `require_all_files_viewed` is optional on protected ref and path rules, defaults to `true`, and is returned by create/list APIs. When the effective policy requires all changed files to be viewed, merge enforcement checks the authenticated actor's viewed-file records for the change request's current `head_commit`. Path prefixes are absolute, normalized boundaries. Direct filesystem enforcement evaluates these rules against resolved backing paths after workspace mount resolution; client responses still use projected paths and do not expose backing workspace paths beyond existing route behavior.
 
 Create a change request:
 
@@ -1406,7 +1407,7 @@ The server validates both refs exist, captures the current target-ref commit as 
 }
 ```
 
-`approval_state` is computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between `base_commit` and `head_commit`, and active required reviewer assignments. In guarded durable mode, a durable change request whose source/target refs exist in durable stores computes those changed paths by walking durable commit parent metadata from `head_commit` back to `base_commit` and collecting recorded changed-path names; local change requests keep using the local VCS ancestry calculation. The effective required approval count is the maximum `required_approvals` from matching rules. `approved` is true only when the numeric approval count is satisfied and every required reviewer has an active approval for the captured `head_commit`. The top-level `require_all_files_viewed` response field is the resolved CR-level policy value for the matched rules, defaulting fail-closed to `true` if approval-state resolution is unavailable; it is not enforced by this approval-state computation yet.
+`approval_state` is computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between `base_commit` and `head_commit`, and active required reviewer assignments. In guarded durable mode, a durable change request whose source/target refs exist in durable stores computes those changed paths by walking durable commit parent metadata from `head_commit` back to `base_commit` and collecting recorded changed-path names; local change requests keep using the local VCS ancestry calculation. The effective required approval count is the maximum `required_approvals` from matching rules. `approved` is true only when the numeric approval count is satisfied and every required reviewer has an active approval for the captured `head_commit`. The top-level `require_all_files_viewed` response field is the resolved CR-level policy value for the matched rules, defaulting fail-closed to `true` if approval-state resolution is unavailable. Merge enforcement uses this flag together with the authenticated actor's viewed-file records.
 
 Read and list change requests:
 
@@ -1668,6 +1669,26 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/reject \
   -H "Idempotency-Key: <retry-key>"
 ```
 
+List or update the authenticated actor's viewed-file state for the change request's current `head_commit`:
+
+```bash
+curl http://localhost:3000/change-requests/<change-request-id>/viewed-files \
+  -H "Authorization: User root"
+
+curl -X PUT http://localhost:3000/change-requests/<change-request-id>/viewed-files \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "path": "/contracts/loi-acme-q2.docx.md",
+    "viewed": true
+  }'
+```
+
+`GET` and `PUT` responses include `viewed_files`, `required_paths`, `unviewed_paths`, `all_required_files_viewed`, `require_all_files_viewed`, and `approval_state`. Viewed-file records are scoped to the authenticated actor and the change request's recorded `head_commit`; they are not shared across users. `PUT` accepts only paths present in the current changed-path set for the change request. Marking a path outside that set returns `400 Bad Request` without mutation. Repeating the same `(path, viewed)` value for the same actor, change request, and head is idempotent.
+
+`PUT` responses also include `viewed_file` and `updated`. Audit details for viewed-file updates include change-request id, path, viewed flag, actor uid, head commit, and record version only.
+
 Fast-forward merge an open change request:
 
 ```bash
@@ -1676,7 +1697,7 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/merge \
   -H "Idempotency-Key: <retry-key>"
 ```
 
-Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Dismissed approvals do not count. Required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs for the captured `head_commit`; approval by another user can satisfy the numeric count but not the required reviewer list. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge verifies source freshness under the same local DB write lock as the target compare-and-swap update, updates the target ref to `head_commit`, and marks the change request `merged`.
+Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Dismissed approvals do not count. Required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs for the captured `head_commit`; approval by another user can satisfy the numeric count but not the required reviewer list. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. When `approval_state.require_all_files_viewed` is true, merge also requires the authenticated actor to have marked every required changed path as viewed for the current `head_commit`; otherwise merge returns `403 Forbidden` with `required_paths`, `unviewed_paths`, `all_required_files_viewed`, and `approval_state`. When `require_all_files_viewed` is false, merge does not consult viewed-file state. Empty changed-path sets count as fully viewed. A successful merge verifies source freshness under the same local DB write lock as the target compare-and-swap update, updates the target ref to `head_commit`, and marks the change request `merged`.
 
 All protected-rule, approval, reviewer-assignment, review-comment, approval-dismissal, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Approval, reviewer-assignment, review-comment, approval-dismissal, reject, and merge mutations are limited to open change requests; matching idempotency replays still return the originally recorded non-secret response after the change request becomes terminal. Audit details include review metadata, but not approval comments, review comment bodies, or dismissal reasons. Workspace bearer sessions are rejected from these admin endpoints.
 

@@ -136,6 +136,8 @@ cid = cr["change_request"]["id"]
 c.reviews.assign_reviewer(cid, {"reviewer_uid": 42, "required": True})
 c.reviews.create_comment(cid, {"body": "LGTM"})
 c.reviews.approve(cid)
+c.reviews.set_viewed_file(cid, {"path": "/docs/readme.md", "viewed": True})
+viewed = c.reviews.list_viewed_files(cid)
 merged = c.reviews.merge(cid)
 ```
 

@@ -81,6 +81,13 @@ const cr = await admin.reviews.createChangeRequestFromSession(
   },
   { idempotencyKey: "incident-demo-cr-1" },
 );
+
+const changeRequestId = cr.change_request.id;
+await admin.reviews.setViewedFile(changeRequestId, {
+  path: "/incidents/checkout-latency/work/report.md",
+  viewed: true,
+});
+const viewed = await admin.reviews.listViewedFiles(changeRequestId);
 ```
 
 Global VCS routes are admin-gated by the current Stratum server. Workspace bearer clients may use filesystem,
@@ -123,7 +130,7 @@ Semantic search remains unsupported in the SDK until the backend exposes it. Thi
 - `client.fs`: read/write bytes and text, mkdir, list, stat, metadata patch, delete, copy, move.
 - `client.search`: grep, find, tree, and semantic search through the server route.
 - `client.vcs`: commit, log, revert, status, diff, list/create/update refs.
-- `client.reviews`: protected refs/paths, change requests, approvals, reviewers, comments, reject, merge.
+- `client.reviews`: protected refs/paths, change requests, approvals, reviewers, comments, viewed files, reject, merge.
 - `client.runs`: create and read run records, stdout, stderr.
 - `client.execute`: submit/list/get/wait/cancel jobs against the gated `/execute` route plus a `run` convenience that waits and reads stdout/stderr. No idempotency key is sent on execute routes.
 - `client.workspaces`: list, get, create, issue workspace tokens.
