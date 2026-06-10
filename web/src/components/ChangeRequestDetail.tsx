@@ -159,6 +159,8 @@ function ActionRow({
   const merge = useMergeChangeRequest();
   const revert = useRevertChangeRequest();
   const [showRevertConfirm, setShowRevertConfirm] = useState(false);
+  const [showMergeConfirm, setShowMergeConfirm] = useState(false);
+  const [showRejectConfirm, setShowRejectConfirm] = useState(false);
 
   const mergeBlockedByViewing = approved && item.require_all_files_viewed;
   const canMerge = approved && !mergeBlockedByViewing && !isTerminal;
@@ -185,7 +187,11 @@ function ActionRow({
         </button>
         <button
           type="button"
-          onClick={() => merge.mutate({ id })}
+          onClick={() => {
+            merge.reset();
+            setShowRejectConfirm(false);
+            if (canMerge) setShowMergeConfirm(true);
+          }}
           disabled={!canMerge || anyPending}
           title={
             isTerminal
@@ -207,7 +213,11 @@ function ActionRow({
         </button>
         <button
           type="button"
-          onClick={() => reject.mutate({ id })}
+          onClick={() => {
+            reject.reset();
+            setShowMergeConfirm(false);
+            if (!isTerminal) setShowRejectConfirm(true);
+          }}
           disabled={isTerminal || anyPending}
           title={isTerminal ? `This CR is ${status} — actions are read-only.` : undefined}
           className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition enabled:hover:border-rose-400 enabled:hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
@@ -229,7 +239,7 @@ function ActionRow({
         )}
       </div>
 
-      {!isTerminal && (
+      {!isTerminal && !showMergeConfirm && !showRejectConfirm && (
         <p className="max-w-2xl text-[12.5px] leading-relaxed text-stone-500">
           {canMerge ? (
             <>
@@ -241,6 +251,79 @@ function ActionRow({
             mergeBlockedReason
           )}
         </p>
+      )}
+
+      {showMergeConfirm && !isTerminal && (
+        <div className="max-w-2xl rounded-md border border-orange-200 bg-orange-50 px-3 py-3">
+          <p className="text-[13px] leading-relaxed text-orange-950">
+            Merge {cr.source_ref} into {cr.target_ref}. This will advance {cr.target_ref} from{" "}
+            {shortHash(cr.base_commit)} to {shortHash(cr.head_commit)}.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                merge.mutate(
+                  { id },
+                  {
+                    onSuccess: () => setShowMergeConfirm(false),
+                  },
+                )
+              }
+              disabled={merge.isPending}
+              className="rounded-md border border-orange-700 bg-orange-700 px-3 py-1.5 text-[12.5px] font-medium text-white transition enabled:hover:bg-orange-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {merge.isPending ? "Merging…" : "Confirm merge"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                merge.reset();
+                setShowMergeConfirm(false);
+              }}
+              disabled={merge.isPending}
+              className="rounded-md border border-orange-300 bg-white px-3 py-1.5 text-[12.5px] font-medium text-orange-900 transition enabled:hover:border-orange-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showRejectConfirm && !isTerminal && (
+        <div className="max-w-2xl rounded-md border border-rose-200 bg-rose-50 px-3 py-3">
+          <p className="text-[13px] leading-relaxed text-rose-900">
+            Reject this change request. It will be closed without advancing {cr.target_ref}.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                reject.mutate(
+                  { id },
+                  {
+                    onSuccess: () => setShowRejectConfirm(false),
+                  },
+                )
+              }
+              disabled={reject.isPending}
+              className="rounded-md border border-rose-700 bg-rose-700 px-3 py-1.5 text-[12.5px] font-medium text-white transition enabled:hover:bg-rose-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {reject.isPending ? "Rejecting…" : "Confirm reject"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                reject.reset();
+                setShowRejectConfirm(false);
+              }}
+              disabled={reject.isPending}
+              className="rounded-md border border-rose-300 bg-white px-3 py-1.5 text-[12.5px] font-medium text-rose-800 transition enabled:hover:border-rose-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
 
       {showRevertConfirm && status === "merged" && (

@@ -765,3 +765,172 @@ describe("ChangeRequestDetail — comments (D4)", () => {
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 9.2 — merge/reject confirmations + scoped section states
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("ChangeRequestDetail — merge/reject confirmations", () => {
+  it("clicking Reject opens an inline confirmation region", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)));
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    expect(screen.getByRole("button", { name: /^confirm reject$/i })).toBeTruthy();
+  });
+
+  it("reject mutation is not called until Confirm reject is clicked", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/reject") && init?.method === "POST") {
+        return okJson({ change_request: { ...OPEN_PENDING.change_request, status: "rejected" } });
+      }
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("button", { name: /^reject$/i });
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    expect(detailFetch.mock.calls.find(([u, i]) => String(u).includes("/reject") && i?.method === "POST")).toBeUndefined();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^confirm reject$/i }));
+    });
+    await waitFor(() => {
+      expect(detailFetch.mock.calls.find(([u, i]) => String(u).includes("/reject") && i?.method === "POST")).toBeTruthy();
+    });
+  });
+
+  it("Cancel closes the reject confirmation and resets reject errors", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/reject") && init?.method === "POST") return httpError(403, { error: "not permitted" });
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("button", { name: /^reject$/i });
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^confirm reject$/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    expect(screen.queryByRole("button", { name: /^confirm reject$/i })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("clicking Merge on an approved ready CR opens an inline confirmation region", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED_READY)), {
+      requireAllViewed: true,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    fireEvent.click(screen.getByRole("button", { name: /^merge$/i }));
+    expect(screen.getByRole("button", { name: /^confirm merge$/i })).toBeTruthy();
+    expect(screen.getByText(/main from 00000000 to a4f9c1b2/i)).toBeTruthy();
+  });
+
+  it("merge mutation is not called until Confirm merge is clicked", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/merge") && init?.method === "POST") {
+        return okJson({ change_request: { ...OPEN_APPROVED_READY.change_request, status: "merged" } });
+      }
+      return okJson(OPEN_APPROVED_READY);
+    });
+    renderDetail(detailFetch, { requireAllViewed: true });
+    await screen.findByRole("button", { name: /^merge$/i });
+    fireEvent.click(screen.getByRole("button", { name: /^merge$/i }));
+    expect(detailFetch.mock.calls.find(([u, i]) => String(u).includes("/merge") && i?.method === "POST")).toBeUndefined();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^confirm merge$/i }));
+    });
+    await waitFor(() => {
+      expect(detailFetch.mock.calls.find(([u, i]) => String(u).includes("/merge") && i?.method === "POST")).toBeTruthy();
+    });
+  });
+
+  it("Cancel closes the merge confirmation and resets merge errors", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/merge") && init?.method === "POST") return httpError(403, { error: "blocked" });
+      return okJson(OPEN_APPROVED_READY);
+    });
+    renderDetail(detailFetch, { requireAllViewed: true });
+    await screen.findByRole("button", { name: /^merge$/i });
+    fireEvent.click(screen.getByRole("button", { name: /^merge$/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^confirm merge$/i }));
+    });
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    expect(screen.queryByRole("button", { name: /^confirm merge$/i })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("terminal CRs do not show active merge/reject confirmations", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(MERGED)));
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    expect(screen.queryByRole("button", { name: /^confirm merge$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^confirm reject$/i })).toBeNull();
+  });
+});
+
+describe("ChangeRequestDetail — scoped section states", () => {
+  it("approvals load error renders only the approvals alert and keeps other sections visible", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      approvalsResponse: httpError(503, { error: "approvals down" }),
+    });
+    expect(await screen.findByText(/Couldn't load approvals/i)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^reviewers$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^comments$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^diff$/i })).toBeTruthy();
+  });
+
+  it("reviewers load error renders only the reviewers alert and keeps other sections visible", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      reviewersResponse: httpError(503, { error: "reviewers down" }),
+    });
+    expect(await screen.findByText(/Couldn't load reviewers/i)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^approval state$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^comments$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^diff$/i })).toBeTruthy();
+  });
+
+  it("comments load error renders only the comments alert and keeps other sections visible", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      commentsResponse: httpError(503, { error: "comments down" }),
+    });
+    expect(await screen.findByText(/Couldn't load comments/i)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^approval state$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^reviewers$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^diff$/i })).toBeTruthy();
+  });
+
+  it("diff load error renders only the diff alert and keeps other sections visible", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      diffResponse: httpError(503, { error: "diff down" }),
+    });
+    expect(await screen.findByText(/Couldn't load diff/i)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^approval state$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^reviewers$/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /^comments$/i })).toBeTruthy();
+  });
+
+  it("empty reviewers shows No reviewers assigned.", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      reviewersResponse: EMPTY_REVIEWERS,
+    });
+    expect(await screen.findByText("No reviewers assigned.")).toBeTruthy();
+  });
+
+  it("empty comments shows No comments yet.", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      commentsResponse: EMPTY_COMMENTS,
+    });
+    expect(await screen.findByText("No comments yet.")).toBeTruthy();
+  });
+
+  it("read-only terminal CRs hide reviewer assignment and comment composer controls", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(MERGED)));
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    expect(screen.queryByLabelText(/^reviewer$/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /add comment/i })).toBeNull();
+  });
+});
