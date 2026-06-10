@@ -59,6 +59,10 @@ const capabilities = await client.getCapabilities();
 const workspace = new StratumAgentWorkspace({ client, capabilities });
 ```
 
+## Runnable examples
+
+See [`examples/README.md`](examples/README.md) for the incident change-request example. It consumes the env file from `stratumctl workspace seed-demo`, edits workspace files through the OpenAI Agents editor adapter, and opens a Stratum change request through the TypeScript SDK.
+
 ### OpenAI Agents
 
 ```ts
