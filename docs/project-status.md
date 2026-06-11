@@ -1,8 +1,8 @@
 # Stratum Project Status
 
-- Last updated: 2026-06-04
-- Branch: `v2/foundation`
-- Backend work branch: `v2/foundation`
+- Last updated: 2026-06-11
+- Branch: `private-beta-closeout`
+- Backend work branch: `private-beta-closeout`
 - Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
 - Latest completed backend slice: Conformance Test Scaffolding (Slice 24)
 - Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
@@ -11,6 +11,28 @@
 - Planned next SDK slice: published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Task 11 / Audit Trail Parity Closeout
+
+Delivered from `docs/plans/2026-06-11-audit-trail-parity.md`.
+
+Completed scope:
+
+- Kept durable-cloud `/audit` explicitly unsupported for private beta. Durable-cloud supported mutations continue to persist audit events through the durable audit store, but hosted audit listing remains blocked until a repo/tenant-scoped listing API and durable admin auth contract exist.
+- Added TypeScript SDK parity for the backend-emitted `change_request_file_view` audit action.
+- Tightened the web `/audit` screen so it uses capability audit limits, renders file-view audit events with a first-class label, keeps hosted-preview audit unavailable without calling `/audit`, and shows only a bounded safe detail preview instead of dumping raw-risk detail keys inline.
+- Added Rust characterization coverage for private-beta audit action serialization/export classes and strengthened review-route audit redaction assertions for create and file-view paths.
+- Updated audit posture, HTTP guide, and private-beta contract wording to distinguish durable audit persistence from unsupported hosted audit listing.
+
+Focused verification during implementation:
+
+- `bun run --cwd sdk/typescript typecheck` passed.
+- `bun run --cwd sdk/typescript test:run -- client.test.ts` passed **28** tests.
+- `bun run --cwd web test:run -- AuditPlaceholder.test.tsx` passed **5** tests.
+- `bun run --cwd web typecheck` passed.
+- `bun run --cwd web build` passed.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task11 cargo test --locked audit::tests --lib -- --nocapture` passed **29** tests.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task11 cargo test --locked server::routes_review::tests --lib -- --nocapture` passed **72** tests.
 
 ## Slice 24 / Conformance Test Scaffolding
 

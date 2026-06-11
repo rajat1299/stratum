@@ -8,14 +8,40 @@ const auditKeys = {
   list: (limit: number) => ["audit", "list", limit] as const,
 };
 
+const FALLBACK_AUDIT_LIMIT = 100;
+const DETAIL_PREVIEW_LIMIT = 6;
+const SAFE_DETAIL_KEYS = new Set([
+  "route",
+  "change_request_id",
+  "source_ref",
+  "target_ref",
+  "base_commit",
+  "head_commit",
+  "path",
+  "viewed",
+  "viewed_by",
+  "version",
+  "ref",
+  "rule",
+  "quota_kind",
+  "route_family",
+  "has_workspace",
+]);
+const RISKY_DETAIL_KEY =
+  /(^|_)(token|hash|secret|sql|body|content|provider_error|db_url|database_url|r2_endpoint|endpoint|object_key|idempotency_key|commit_message)(_|$)/i;
+
 export function AuditPlaceholder() {
   const client = useStratumClient();
-  const [limit, setLimit] = useState(50);
+  const [selectedLimit, setSelectedLimit] = useState<number | null>(null);
   const capabilities = useCapabilities();
   const auditSupportKnown = capabilities.data !== undefined;
   const auditAvailable = capabilities.data?.routes.audit.available === true;
   const auditUnavailable = auditSupportKnown && !auditAvailable;
   const auditLoadFailed = !capabilities.isLoading && !auditSupportKnown;
+  const auditDefaultLimit = capabilities.data?.limits.audit_default_limit ?? FALLBACK_AUDIT_LIMIT;
+  const auditMaxLimit = capabilities.data?.limits.audit_max_limit ?? FALLBACK_AUDIT_LIMIT;
+  const limit = Math.min(selectedLimit ?? auditDefaultLimit, auditMaxLimit);
+  const limitOptions = auditLimitOptions(limit, auditMaxLimit);
   const audit = useQuery({
     queryKey: auditKeys.list(limit),
     queryFn: () => client.audit.list({ limit }),
@@ -44,11 +70,11 @@ export function AuditPlaceholder() {
           </span>
           <select
             value={limit}
-            onChange={(event) => setLimit(Number(event.target.value))}
+            onChange={(event) => setSelectedLimit(Number(event.target.value))}
             disabled={capabilities.isLoading || auditUnavailable || auditLoadFailed}
             className="h-9 rounded-[4px] border border-stone-200 bg-white px-2.5 font-mono text-[12px] text-stone-950 outline-none transition focus:border-stone-950"
           >
-            {[25, 50, 100, 250].map((value) => (
+            {limitOptions.map((value) => (
               <option key={value} value={value}>
                 {value}
               </option>
@@ -132,6 +158,7 @@ function Metric({ label, value }: { readonly label: string; readonly value: stri
 function AuditEventRow({ event }: { readonly event: AuditEvent }) {
   const target = event.resource.path ?? event.resource.id ?? event.resource.kind;
   const workspace = event.workspace?.session_ref ?? event.workspace?.base_ref ?? null;
+  const detailPreview = auditDetailPreview(event.details);
   return (
     <article className="grid gap-3 px-4 py-3 md:grid-cols-[170px_1fr_auto]">
       <div className="font-mono text-[11px] text-stone-500">
@@ -154,9 +181,9 @@ function AuditEventRow({ event }: { readonly event: AuditEvent }) {
         <div className="mt-2 min-w-0 truncate font-mono text-[12.5px] text-stone-950" title={target}>
           {shortTarget(target)}
         </div>
-        {Object.keys(event.details).length > 0 && (
+        {detailPreview.length > 0 && (
           <dl className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
-            {Object.entries(event.details).map(([key, value]) => (
+            {detailPreview.map(([key, value]) => (
               <div key={key} className="flex gap-1">
                 <dt>{key}</dt>
                 <dd className="text-stone-700">{value}</dd>
@@ -232,6 +259,7 @@ function actionLabel(action: string): string {
     change_request_approve: "Approved",
     change_request_approval_dismiss: "Dismissed approval",
     change_request_comment_create: "Commented",
+    change_request_file_view: "Viewed file",
     change_request_reviewer_assign: "Assigned reviewer",
     change_request_reject: "Rejected",
     change_request_merge: "Merged",
@@ -247,6 +275,18 @@ function actionLabel(action: string): string {
     idempotency_quota_exceeded: "Rate limited",
   };
   return labels[action] ?? sentenceCase(action);
+}
+
+function auditLimitOptions(current: number, max: number): number[] {
+  return [...new Set([25, 50, 100, 250, current])]
+    .filter((value) => value <= max)
+    .sort((left, right) => left - right);
+}
+
+function auditDetailPreview(details: AuditEvent["details"]): [string, string][] {
+  return Object.entries(details)
+    .filter(([key]) => SAFE_DETAIL_KEYS.has(key) && !RISKY_DETAIL_KEY.test(key))
+    .slice(0, DETAIL_PREVIEW_LIMIT);
 }
 
 function sentenceCase(value: string): string {

@@ -1,16 +1,18 @@
 # Audit Posture
 
-Last updated: 2026-06-02
+Last updated: 2026-06-11
 
 ## Source Of Record
 
 Stratum treats local audit persistence and the Postgres `audit_events` table as the durable audit system of record. Event-bus export is a secondary delivery path. If export is disabled or a best-effort export fails, the durable audit record remains the local/Postgres audit event.
 
+Durable-cloud supported mutations persist audit events through the durable audit store, but hosted durable audit listing remains unsupported for private beta. Enabling hosted `/audit` requires a repo/tenant-scoped listing contract, durable admin auth, and authoritative repo identity on listed audit rows. Until that exists, durable-cloud `/audit` must stay fail-closed and clients must not fall back to local `.vfs` state.
+
 ## Current Coverage
 
-Current audit events cover mutating filesystem operations, VCS commit/revert/ref mutations, route policy allow/deny decisions, idempotency quota failures, protected-rule and change-request workflows, workspace creation, workspace-token lifecycle events, run-record creation, hosted OIDC/SAML refresh-token lifecycle events, and provider-free SCIM provisioning events.
+Current audit events cover mutating filesystem operations, VCS commit/revert/ref mutations, route policy allow/deny decisions, idempotency quota failures, protected-rule and change-request workflows including reviewer assignment, file-view state, approval dismissal, rejection, and merge, workspace creation, workspace-token lifecycle events, run-record creation, hosted OIDC/SAML refresh-token lifecycle events, and provider-free SCIM provisioning events.
 
-Read audit coverage, hosted audit operations, customer audit consoles, long-term retention/export productization, and production broker delivery are not complete.
+Read audit coverage, hosted audit listing, customer audit consoles, long-term retention/export productization, and production broker delivery are not complete.
 
 ## Redaction Guarantees
 

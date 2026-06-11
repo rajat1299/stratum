@@ -566,6 +566,7 @@ export type AuditAction =
   | "change_request_approve"
   | "change_request_approval_dismiss"
   | "change_request_comment_create"
+  | "change_request_file_view"
   | "change_request_reviewer_assign"
   | "change_request_reject"
   | "change_request_merge"

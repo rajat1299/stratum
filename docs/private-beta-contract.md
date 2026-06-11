@@ -108,7 +108,11 @@ when the matched protection policy requires it), view audit events, and revert
 if needed. The reviewer console reads and writes viewed-file state through the
 review HTTP routes; merge is blocked only when the effective policy requires all
 changed files to be viewed and the current authenticated actor still has unviewed
-required paths. Local seeding is
+required paths. The local web `/audit` screen lists recent audit events for a
+user-admin session and renders the golden-path actions, including workspace/token
+events, filesystem and VCS mutations, policy decisions, reviewer assignment,
+file-view state, approvals, rejection, merge, and idempotency quota failures.
+Local seeding is
 packaged as the local-state-only `stratumctl workspace seed-demo`, which writes
 the issued workspace token to a chmod-600 env file and prints safe next commands
 without leaking secrets.
@@ -120,6 +124,9 @@ Hosted durable close-out remains narrower:
   repo-bound hosted admin bearer
 - pass explicit workspace and repo context on every hosted durable request
 - use a session-ref for mounted durable mutations
+- persist hosted durable mutation audit events through the durable audit store
+  while keeping hosted `/audit` listing unsupported until a repo/tenant-scoped
+  listing contract exists
 - keep OIDC, SAML, SCIM, audit listing, runs, execute, semantic search, MCP,
   FUSE, and hosted admin screens out of the promised demo
 

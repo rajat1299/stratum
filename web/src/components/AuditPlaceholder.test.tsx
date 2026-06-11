@@ -68,13 +68,14 @@ describe("AuditPlaceholder", () => {
     expect(await screen.findByRole("heading", { name: "Audit" })).toBeTruthy();
     expect(await screen.findByText("Committed")).toBeTruthy();
     expect(screen.getByText("Blocked")).toBeTruthy();
-    expect(screen.getByText("root")).toBeTruthy();
+    expect(screen.getAllByText("root").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("alice")).toBeTruthy();
     expect(screen.getByText(/abc12345/)).toBeTruthy();
     expect(screen.getByText("/contracts/secret.md")).toBeTruthy();
+    expect(screen.getByText("Viewed file")).toBeTruthy();
     expect(screen.queryByText(/phase/i)).toBeNull();
     await waitFor(() =>
-      expect(fetchSpy.mock.calls.some(([input]) => String(input).includes("/audit?limit=50"))).toBe(
+      expect(fetchSpy.mock.calls.some(([input]) => String(input).includes("/audit?limit=100"))).toBe(
         true,
       ),
     );
@@ -124,7 +125,7 @@ describe("AuditPlaceholder", () => {
     });
 
     renderAudit(fetchSpy, (queryClient) => {
-      queryClient.setQueryData(["audit", "list", 50], auditEventsPayload());
+      queryClient.setQueryData(["audit", "list", 100], auditEventsPayload());
     });
 
     expect(
@@ -135,6 +136,64 @@ describe("AuditPlaceholder", () => {
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThanOrEqual(3);
     expect(fetchSpy.mock.calls.some(([input]) => String(input).includes("/audit"))).toBe(false);
   });
+
+  it("renders a bounded detail preview without risky raw detail keys", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async (input) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.endsWith("/v1/capabilities")) {
+        return okJson(loadLocalFixture());
+      }
+      return okJson({
+        events: [
+          {
+            id: "event-risky-details",
+            sequence: 13,
+            timestamp: "2026-06-06T19:01:00Z",
+            actor: { uid: 0, username: "root", delegate: null },
+            workspace: null,
+            action: "change_request_file_view",
+            resource: { kind: "change_request", id: "cr-1", path: null },
+            outcome: "success",
+            details: {
+              path: "/contracts/secret.md",
+              viewed: "true",
+              viewed_by: "0",
+              head_commit: "def67890",
+              version: "2",
+              route: "PUT /change-requests/{id}/viewed-files",
+              source_ref: "review/cr-1",
+              target_ref: "main",
+              base_commit: "abc12345",
+              change_request_id: "cr-1",
+              token: "raw-token",
+              request_body: "full body",
+              sql: "select * from secrets",
+              provider_error: "provider exploded",
+            },
+          },
+        ],
+      });
+    });
+
+    renderAudit(fetchSpy);
+
+    expect(await screen.findByText("Viewed file")).toBeTruthy();
+    expect(screen.getByText("path")).toBeTruthy();
+    expect(screen.getByText("/contracts/secret.md")).toBeTruthy();
+    expect(screen.getByText("viewed")).toBeTruthy();
+    expect(screen.getByText("true")).toBeTruthy();
+    expect(screen.getByText("route")).toBeTruthy();
+    expect(screen.queryByText("source_ref")).toBeNull();
+    expect(screen.queryByText("review/cr-1")).toBeNull();
+    expect(screen.queryByText("token")).toBeNull();
+    expect(screen.queryByText("raw-token")).toBeNull();
+    expect(screen.queryByText("request_body")).toBeNull();
+    expect(screen.queryByText("full body")).toBeNull();
+    expect(screen.queryByText("sql")).toBeNull();
+    expect(screen.queryByText(/select/i)).toBeNull();
+    expect(screen.queryByText("provider_error")).toBeNull();
+    expect(screen.queryByText(/provider exploded/i)).toBeNull();
+  });
 });
 
 function auditEventsResponse(): Response {
@@ -144,6 +203,22 @@ function auditEventsResponse(): Response {
 function auditEventsPayload() {
   return {
     events: [
+      {
+        id: "event-3",
+        sequence: 13,
+        timestamp: "2026-06-06T19:01:00Z",
+        actor: { uid: 0, username: "root", delegate: null },
+        workspace: {
+          id: "ws-1",
+          root_path: "/contracts",
+          base_ref: "main",
+          session_ref: "agent/review",
+        },
+        action: "change_request_file_view",
+        resource: { kind: "change_request", id: "cr-1", path: null },
+        outcome: "success",
+        details: { path: "/contracts/loi.md", viewed: "true" },
+      },
       {
         id: "event-2",
         sequence: 12,

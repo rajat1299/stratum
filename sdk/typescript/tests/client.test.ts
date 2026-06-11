@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   StratumClient,
   type ApprovalResponse,
+  type AuditAction,
   type AuditListResponse,
   type CapabilityManifest,
   type ChangeRequestResponse,
@@ -243,6 +244,12 @@ describe("resource clients", () => {
     expect(requests[0]?.url).toBe("https://stratum.example/audit?limit=25");
     expect(requests[0]?.headers.get("Authorization")).toBe("User root");
     expect(requests[0]?.headers.has("Idempotency-Key")).toBe(false);
+  });
+
+  it("types private-beta audit actions emitted by review routes", () => {
+    const action: AuditAction = "change_request_file_view";
+
+    expect(action).toBe("change_request_file_view");
   });
 
   it("builds filesystem calls with auth, body, and supplied idempotency", async () => {

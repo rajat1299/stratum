@@ -4774,7 +4774,28 @@ mod tests {
         assert_eq!(events[0].action, AuditAction::ChangeRequestCreate);
         assert_eq!(events[0].resource.kind, AuditResourceKind::ChangeRequest);
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains("body must stay out of audit"));
+        for forbidden in [
+            "Legal update",
+            "body must stay out of audit",
+            "change-request-create-redaction",
+            "idempotency-key",
+            "idempotency_key",
+            "request_body",
+            "title",
+            "description",
+            "token",
+            "token_hash",
+            "provider_error",
+            "backend error",
+            "file content",
+            "commit message",
+            "select * from",
+        ] {
+            assert!(
+                !audit_json.contains(forbidden),
+                "audit should omit {forbidden}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5656,8 +5677,27 @@ mod tests {
             Some("1")
         );
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains("assign-alice"));
-        assert!(!audit_json.contains("metadata only"));
+        for forbidden in [
+            "assign-alice",
+            "metadata only",
+            "idempotency-key",
+            "idempotency_key",
+            "request_body",
+            "title",
+            "description",
+            "token",
+            "token_hash",
+            "provider_error",
+            "backend error",
+            "file content",
+            "commit message",
+            "select * from",
+        ] {
+            assert!(
+                !audit_json.contains(forbidden),
+                "audit should omit {forbidden}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7817,6 +7857,27 @@ mod tests {
                 .filter(|event| event.action == AuditAction::ChangeRequestFileView)
                 .collect::<Vec<_>>();
             assert_eq!(mutation_events.len(), 1);
+            let audit_json = serde_json::to_string(&events).unwrap();
+            for forbidden in [
+                "viewed-file-replay",
+                "idempotency-key",
+                "idempotency_key",
+                "request_body",
+                "title",
+                "description",
+                "token",
+                "token_hash",
+                "provider_error",
+                "backend error",
+                "file content",
+                "commit message",
+                "select * from",
+            ] {
+                assert!(
+                    !audit_json.contains(forbidden),
+                    "audit should omit {forbidden}"
+                );
+            }
         }
     }
 
