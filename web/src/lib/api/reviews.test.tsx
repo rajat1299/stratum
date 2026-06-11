@@ -429,6 +429,7 @@ describe("useRevertChangeRequest", () => {
     expect(calledKeys).toContainEqual(reviewKeys.list());
     expect(calledKeys).toContainEqual(reviewKeys.detail("cr-1"));
     expect(calledKeys).toContainEqual(reviewKeys.all);
+    expect(calledKeys).toContainEqual(["audit"]);
   });
 });
 

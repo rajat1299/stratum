@@ -509,6 +509,56 @@ describe("ChangeRequestDetail — action row (D3 wired)", () => {
     });
   });
 
+  it("on a merged CR: successful durable revert shows bounded audit evidence", async () => {
+    const revertCommit = "2".repeat(64);
+    const expectedHead = "3".repeat(64);
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/vcs/revert") && init?.method === "POST") {
+        return okJson({
+          reverted_to: MERGED.change_request.base_commit,
+          revert_commit: revertCommit,
+          target_ref: MERGED.change_request.target_ref,
+          target_commit: MERGED.change_request.base_commit,
+          expected_head: expectedHead,
+        });
+      }
+      return okJson(MERGED);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+
+    fireEvent.click(screen.getByRole("button", { name: /^revert$/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^confirm revert$/i }));
+    });
+
+    expect(await screen.findByText(/reverted main to 00000000/i)).toBeTruthy();
+    expect(screen.getByText(/revert commit 22222222/i)).toBeTruthy();
+    expect(screen.getByText(/vcs revert event/i)).toBeTruthy();
+  });
+
+  it("on a merged CR: stale revert conflict is called out clearly", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/vcs/revert") && init?.method === "POST") {
+        return httpError(409, { error: "ref compare-and-swap mismatch" });
+      }
+      return okJson(MERGED);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+
+    fireEvent.click(screen.getByRole("button", { name: /^revert$/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^confirm revert$/i }));
+    });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/revert conflict or stale head/i);
+    expect(alert.textContent).toMatch(/ref compare-and-swap mismatch/i);
+  });
+
   it("clicking Approve fires POST /change-requests/:id/approvals", async () => {
     const detailFetch = vi.fn<typeof fetch>(async (input) => {
       const url = String(typeof input === "string" || input instanceof URL ? input : input.url);

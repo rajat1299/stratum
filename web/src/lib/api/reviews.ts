@@ -318,6 +318,7 @@ export function useRevertChangeRequest(): UseMutationResult<
       void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
       void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
       void queryClient.invalidateQueries({ queryKey: reviewKeys.all });
+      void queryClient.invalidateQueries({ queryKey: ["audit"] });
     },
   });
 }

@@ -194,6 +194,47 @@ describe("AuditPlaceholder", () => {
     expect(screen.queryByText("provider_error")).toBeNull();
     expect(screen.queryByText(/provider exploded/i)).toBeNull();
   });
+
+  it("shows bounded revert audit evidence fields", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async (input) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.endsWith("/v1/capabilities")) {
+        return okJson(loadLocalFixture());
+      }
+      return okJson({
+        events: [
+          {
+            id: "event-revert",
+            sequence: 14,
+            timestamp: "2026-06-06T19:02:00Z",
+            actor: { uid: 0, username: "root", delegate: null },
+            workspace: null,
+            action: "vcs_revert",
+            resource: { kind: "commit", id: "2".repeat(64), path: null },
+            outcome: "success",
+            details: {
+              target_ref: "main",
+              reverted_to: "1".repeat(64),
+              target_commit: "1".repeat(64),
+              expected_head: "3".repeat(64),
+              request_body: "do not show",
+            },
+          },
+        ],
+      });
+    });
+
+    renderAudit(fetchSpy);
+
+    expect(await screen.findByText("Reverted")).toBeTruthy();
+    expect(screen.getByText("target_ref")).toBeTruthy();
+    expect(screen.getByText("main")).toBeTruthy();
+    expect(screen.getByText("reverted_to")).toBeTruthy();
+    expect(screen.getByText("target_commit")).toBeTruthy();
+    expect(screen.getByText("expected_head")).toBeTruthy();
+    expect(screen.queryByText("request_body")).toBeNull();
+    expect(screen.queryByText("do not show")).toBeNull();
+  });
 });
 
 function auditEventsResponse(): Response {

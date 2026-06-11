@@ -169,6 +169,10 @@ export interface StratumCommitInfo {
 
 export interface StratumRevertResult {
   readonly reverted_to: string;
+  readonly revert_commit?: string;
+  readonly target_ref?: string;
+  readonly target_commit?: string;
+  readonly expected_head?: string;
 }
 
 export interface StratumRef {

@@ -10,6 +10,7 @@ import {
   type ChangeRequestResponse,
   type ExecuteJobSummary,
   type IssueWorkspaceTokenOptions,
+  type StratumRevertResult,
   type WorkspaceRecord,
 } from "../src/index.js";
 
@@ -250,6 +251,24 @@ describe("resource clients", () => {
     const action: AuditAction = "change_request_file_view";
 
     expect(action).toBe("change_request_file_view");
+  });
+
+  it("types durable revert evidence fields while preserving local revert compatibility", async () => {
+    const response = {
+      reverted_to: "1".repeat(64),
+      revert_commit: "2".repeat(64),
+      target_ref: "main",
+      target_commit: "1".repeat(64),
+      expected_head: "3".repeat(64),
+    } satisfies StratumRevertResult;
+    const { fetchImpl } = recordFetch(jsonResponse(response));
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await expect(client.vcs.revert(response.reverted_to)).resolves.toEqual(response);
   });
 
   it("builds filesystem calls with auth, body, and supplied idempotency", async () => {

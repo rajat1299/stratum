@@ -137,6 +137,10 @@ class StratumCommitLog(TypedDict):
 
 class StratumRevertResult(TypedDict):
     reverted_to: str
+    revert_commit: NotRequired[str]
+    target_ref: NotRequired[str]
+    target_commit: NotRequired[str]
+    expected_head: NotRequired[str]
 
 
 class StratumRef(TypedDict):

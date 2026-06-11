@@ -16,6 +16,7 @@ import type {
   ChangeRequestResponse,
   ReviewComment,
   ReviewerAssignment,
+  StratumRevertResult,
   ViewedFilesResponse,
 } from "@stratum/sdk";
 import type { UseQueryResult } from "@tanstack/react-query";
@@ -182,6 +183,7 @@ function ActionRow({
 
   const anyPending = approve.isPending || reject.isPending || merge.isPending || revert.isPending;
   const firstError = approve.error ?? reject.error ?? merge.error ?? revert.error;
+  const firstErrorAction = firstError === revert.error ? "revert" : "action";
 
   return (
     <div className="space-y-2">
@@ -373,7 +375,9 @@ function ActionRow({
         </div>
       )}
 
-      {firstError && <ActionError error={firstError} />}
+      {revert.data && <RevertEvidence result={revert.data} targetRef={cr.target_ref} />}
+
+      {firstError && <ActionError error={firstError} action={firstErrorAction} />}
     </div>
   );
 }
@@ -645,14 +649,51 @@ function CommentRow({ comment }: { readonly comment: ReviewComment }) {
   );
 }
 
-function ActionError({ error }: { readonly error: Error }) {
+function RevertEvidence({
+  result,
+  targetRef,
+}: {
+  readonly result: StratumRevertResult;
+  readonly targetRef: string;
+}) {
+  const resolvedTargetRef = result.target_ref ?? targetRef;
   return (
-    <p
+    <div className="max-w-2xl rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-[12.5px] leading-relaxed text-emerald-950">
+      <p>
+        Reverted {resolvedTargetRef} to {shortHash(result.reverted_to)}.
+      </p>
+      {result.revert_commit && (
+        <p className="mt-1">
+          Revert commit {shortHash(result.revert_commit)}.
+        </p>
+      )}
+      <p className="mt-1 font-mono text-[10.5px] uppercase tracking-wider text-emerald-800">
+        Audit records this as a VCS revert event.
+      </p>
+    </div>
+  );
+}
+
+function ActionError({
+  error,
+  action,
+}: {
+  readonly error: Error;
+  readonly action: "action" | "revert";
+}) {
+  const isRevertConflict = action === "revert" && httpStatusFromError(error) === 409;
+  return (
+    <div
       role="alert"
       className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 font-mono text-[11.5px] text-rose-800"
     >
-      {error.message}
-    </p>
+      {isRevertConflict && (
+        <p className="mb-1 font-sans text-[12.5px] font-medium text-rose-900">
+          Revert conflict or stale head.
+        </p>
+      )}
+      <p>{error.message}</p>
+    </div>
   );
 }
 

@@ -12,6 +12,40 @@
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
+## Task 12 / Revert Rollback Closure
+
+Delivered from `docs/plans/2026-06-11-revert-rollback-closure.md`, grounded in
+`/Users/rajattiwari/virtualfilesystem/stratum_current_state_cto_review.md`'s
+private-beta wedge: review, merge, audit, and rollback.
+
+Completed scope:
+
+- Preserved the existing `POST /vcs/revert` backend contract and durable-cloud
+  audit-listing boundary. Hosted durable `/audit` remains unsupported; local
+  audit listing stays the golden-path evidence surface.
+- Widened TypeScript and Python SDK `StratumRevertResult` types with optional
+  durable evidence fields: `revert_commit`, `target_ref`, `target_commit`, and
+  `expected_head`, while preserving local `{ reverted_to }` compatibility.
+- Made the reviewer-console revert mutation invalidate audit queries, so a
+  visible `/audit` screen refreshes after rollback.
+- Added merged-CR rollback evidence in the review detail action row: restored
+  target ref/commit, durable revert commit when returned, and the VCS revert
+  audit-event marker. Revert `409` failures now call out stale/conflict state
+  while preserving the bounded backend message.
+- Extended the local audit screen's safe detail preview to include bounded
+  revert metadata (`reverted_to`, `target_commit`, `expected_head`) without
+  allowing request bodies, tokens, SQL, provider errors, object keys, or commit
+  messages.
+
+Focused verification:
+
+- `bun run --cwd sdk/typescript typecheck` passed.
+- `bun run --cwd sdk/typescript test:run -- client.test.ts` passed **29** tests.
+- `bun run --cwd web typecheck` passed.
+- `bun run --cwd web test:run -- src/lib/api/reviews.test.tsx src/components/ChangeRequestDetail.test.tsx src/components/AuditPlaceholder.test.tsx` passed **92** tests.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task12 cargo test --locked server::routes_vcs::tests::revert --lib -- --nocapture` passed **3** tests.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task12 cargo test --locked server::routes_vcs::tests::guarded_durable_revert --lib -- --nocapture` passed **11** tests.
+
 ## Task 11 / Audit Trail Parity Closeout
 
 Delivered from `docs/plans/2026-06-11-audit-trail-parity.md`.
