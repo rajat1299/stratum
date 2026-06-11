@@ -6,6 +6,8 @@ This guide walks you through installing, building, and running stratum for the f
 
 - **Rust toolchain** (1.85+) — install from [rustup.rs](https://rustup.rs)
 - macOS, Linux, or WSL on Windows
+- For the private-beta golden path: **Bun** for the TypeScript agent example,
+  **jq** for JSON extraction, and two terminals.
 
 Verify your installation:
 
@@ -130,6 +132,86 @@ curl http://localhost:3000/health
 
 See the [HTTP API Guide](http-api-guide.md) for the full endpoint reference.
 
+## 15-Minute Private Beta Golden Path
+
+This is the local-state private-beta path for a reviewer/operator demo:
+workspace setup, scoped token, agent edit, change request, file-view evidence,
+approval, merge, audit evidence, and rollback. The live flow runs under 15 minutes
+after dependencies are installed and the release build is warm; a first
+cold Rust build may take longer.
+
+From the repository root, initialize a fresh data directory:
+
+```bash
+export STRATUM_DATA_DIR="$PWD/.demo/incident-workspace"
+rm -rf "$STRATUM_DATA_DIR" .stratum-demo
+mkdir -p "$STRATUM_DATA_DIR"
+```
+
+Create the admin user and backing agent token:
+
+```bash
+cargo run --release --bin stratum
+```
+
+Use this interactive setup:
+
+```text
+Admin username: alice
+
+alice@stratum:~ $ su root
+root@stratum:~ $ addagent incident-bot
+Created agent: incident-bot (uid=2)
+Token: REPLACE_WITH_REAL_TOKEN
+root@stratum:~ $ exit
+```
+
+Exit the CLI, then start the HTTP server in terminal 1:
+
+```bash
+STRATUM_DATA_DIR="$STRATUM_DATA_DIR" \
+STRATUM_LISTEN=127.0.0.1:3000 \
+cargo run --release --bin stratum-server
+```
+
+Run the golden path in terminal 2:
+
+```bash
+export STRATUM_AGENT_TOKEN="REPLACE_WITH_REAL_TOKEN"
+export STRATUM_REVIEWER_USER=alice
+./scripts/run-local-golden-path-demo.sh
+```
+
+The script stores machine-readable evidence in
+`.stratum-demo/incident-change-request.json`. The core sequence it runs is:
+
+```bash
+cargo run --release --bin stratumctl -- \
+  --url "$STRATUM_URL" \
+  --user "$STRATUM_ADMIN_USER" \
+  workspace seed-demo
+
+set -a
+source .stratum-demo/incident-workspace.env
+set +a
+
+bun run --cwd sdk/agents example:incident | tee .stratum-demo/incident-change-request.json
+
+export STRATUM_CHANGE_REQUEST_ID="$(jq -r '.changeRequestId' .stratum-demo/incident-change-request.json)"
+export STRATUM_BASELINE_COMMIT="$(jq -r '.baselineCommit' .stratum-demo/incident-change-request.json)"
+export STRATUM_UPDATE_COMMIT="$(jq -r '.updateCommit' .stratum-demo/incident-change-request.json)"
+
+curl -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files"
+curl -X POST "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/approvals"
+curl -X POST "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/merge"
+curl "$STRATUM_URL/audit?limit=25"
+curl -X POST "$STRATUM_URL/vcs/revert"
+curl "$STRATUM_URL/audit?limit=25"
+```
+
+Use `docs/agent-workspace-demo.md` for the presenter script and expected
+operator narration.
+
 ### SDK live smoke (optional)
 
 The TypeScript (`@stratum/sdk`, `@stratum/bash`) and Python (`stratum-sdk`) packages ship **opt-in** tests and examples that call a server you already started. Default `bun run test:run` and `python -m pytest` use mocks only and do **not** need a server.
@@ -215,21 +297,18 @@ cargo run --release --bin stratumctl -- \
   --url http://127.0.0.1:3000 \
   --user root \
   workspace seed-demo
+set -a
 source .stratum-demo/incident-workspace.env
+set +a
 
-# Open a change request from an existing session/source ref to main
-cargo run --release --bin stratumctl -- \
-  --url http://127.0.0.1:3000 \
-  --user root \
-  change-request create \
-  --session-ref agent/incident-demo/session \
-  --target-ref main \
-  --title "Incident update" \
-  --description "Agent changes from the mounted incident workspace." \
-  --idempotency-key incident-demo-cr-1
+# Open a real change request through the checked-in agent example
+bun run --cwd sdk/agents example:incident
 ```
 
-The command assumes the source/session ref already exists; it does not create refs, commit workspace changes, or infer state from the workspace env file.
+The lower-level `change-request create` command assumes the source/session ref
+already exists; it does not create refs, commit workspace changes, or infer state
+from the workspace env file. The checked-in incident example creates the source
+ref and change request from real workspace state.
 
 If no `--read-prefix` or `--write-prefix` flags are supplied, the issued workspace token defaults both scopes to the workspace root. Repeating a flag adds another allowed backing prefix. Workspace bearer tokens expose the workspace root as `/` for filesystem, search, and tree routes, so clients use workspace-relative paths like `/read` rather than `/incidents/checkout-latency/read`. Workspace bearer tokens cannot manage workspace metadata. Global VCS routes remain admin-gated.
 

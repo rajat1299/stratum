@@ -7,10 +7,47 @@
 - Latest completed backend slice: Conformance Test Scaffolding (Slice 24)
 - Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
 - Latest completed SDK slice: SDK beta publishing readiness (`docs/plans/2026-06-11-sdk-beta-publishing.md`)
+- Latest completed private-beta closeout task: Product docs and demo script (`docs/plans/2026-06-11-product-docs-demo-script.md`)
 - Postgres semantic search shipped for durable-cloud (`GET /search/semantic`, SDK `search.semantic`): Slice 20 adds FTS state/files (migration 0019); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); Slice 23 adds pgvector ranking as an additive derived index (migration 0022) with disabled-by-default providers and FTS fallback.
 - Planned next SDK slice: optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Task 15 / Product Docs And Demo Script
+
+Delivered from `docs/plans/2026-06-11-product-docs-demo-script.md`.
+
+Completed scope:
+
+- Added `scripts/run-local-golden-path-demo.sh`, a local-state operator script
+  that runs the incident seed, checked-in `@stratum/agents` example, file-view
+  review evidence, approval, merge, `/audit?limit=25`, `/vcs/revert`, and final
+  audit evidence without printing workspace tokens.
+- Added `scripts/check-getting-started-golden-path-doc.sh` to keep the
+  getting-started guide and presenter demo wired to the real incident example
+  instead of the fragile fake `agent/incident-demo/session` source-ref path.
+- Updated `docs/getting-started.md` with a 15-minute private-beta golden path
+  and exact commands for setup, server start, demo execution, change-request
+  IDs, audit evidence, and rollback.
+- Reworked `docs/agent-workspace-demo.md` into the presenter script for the
+  same path: scoped workspace inspection, deterministic agent edit, review,
+  approval, merge, audit, and revert.
+- Updated seed-demo next-command output and the agent example README to source
+  `.stratum-demo/incident-workspace.env` with auto-export, so child processes
+  receive the workspace env variables.
+
+Focused verification:
+
+- `bash -n scripts/check-getting-started-golden-path-doc.sh scripts/run-local-golden-path-demo.sh` passed.
+- `./scripts/check-getting-started-golden-path-doc.sh` passed.
+- `bun run --cwd sdk/agents test:run -- incident-example.test.ts` passed **4**
+  tests.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task15 cargo test --locked seed_demo_next_commands --bin stratumctl -- --nocapture` passed **2** tests.
+- `cargo fmt --all -- --check` passed.
+- `git diff --check` passed.
+- The live script itself was not run in this docs slice because it requires an
+  interactive backing agent token and running local server; Task 16 owns the
+  release rehearsal.
 
 ## Task 14 / SDK Beta Publishing
 

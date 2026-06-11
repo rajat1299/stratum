@@ -1,22 +1,31 @@
 # Agent Workspace Demo
 
-This guide gives a runnable 7-minute demo for positioning `stratum` as an agent workspace.
+This is the local-state private-beta product demo script. It shows the full
+golden path in under 15 minutes after dependencies are installed and the release
+build is warm: setup, scoped workspace token, agent edit, change request review,
+file-view evidence, approval, merge, local audit evidence, and rollback.
 
 The current demo uses:
 
-- the `stratum` CLI for one-time setup
+- the `stratum` CLI for one-time admin and backing-agent setup
 - the `stratum-server` HTTP API as the single writer
-- `stratumctl workspace seed-demo` plus `stratumctl` after `source` for agent-facing commands
+- `stratumctl workspace seed-demo` for local incident fixture setup
+- `bun run --cwd sdk/agents example:incident` for the checked-in agent edit and
+  change-request creation
+- `scripts/run-local-golden-path-demo.sh` for the exact review, merge, audit,
+  and revert commands
 
 ## Demo Goal
 
-Show that agents need more than raw filesystem access. They need a persistent workspace they can:
+Show that agents need more than raw filesystem access. They need a persistent
+workspace they can:
 
 - inspect
 - search
 - update
 - commit
 - review
+- audit
 - revert
 
 ## Demo Setup
@@ -69,41 +78,54 @@ STRATUM_LISTEN=127.0.0.1:3000 \
 cargo run --release --bin stratum-server
 ```
 
-### 4. Seed the workspace with `stratumctl`
+### 4. Run the golden path
 
 In another terminal, with the server running and the backing agent token from
 `addagent` exported:
 
 ```bash
 export STRATUM_AGENT_TOKEN="<existing-agent-token>"
+export STRATUM_REVIEWER_USER=alice
+./scripts/run-local-golden-path-demo.sh
+```
 
+The script creates `.stratum-demo/incident-workspace.env` with `chmod 600`,
+sources it with auto-export, runs the checked-in agent example, and writes
+`.stratum-demo/incident-change-request.json`. No raw workspace token is printed.
+
+If you want to run the core commands manually, use the same sequence:
+
+```bash
 cargo run --release --bin stratumctl -- \
   --url http://127.0.0.1:3000 \
   --user root \
   workspace seed-demo
-```
 
-This local-state-only command creates the `incident-demo` workspace at
-`/demo/incident-workspace`, creates the workspace root, seeds the files from
-`examples/incident-workspace`, issues a scoped workspace token, and writes it to
-`.stratum-demo/incident-workspace.env` with `chmod 600`. The command prints safe
-next steps only; no raw tokens are printed.
-
-Load the env file and inspect the workspace:
-
-```bash
+set -a
 source .stratum-demo/incident-workspace.env
-stratumctl tree /
-stratumctl grep timeout /
+set +a
+
+bun run --cwd sdk/agents example:incident | tee .stratum-demo/incident-change-request.json
+
+export STRATUM_CHANGE_REQUEST_ID="$(jq -r '.changeRequestId' .stratum-demo/incident-change-request.json)"
+export STRATUM_BASELINE_COMMIT="$(jq -r '.baselineCommit' .stratum-demo/incident-change-request.json)"
+export STRATUM_UPDATE_COMMIT="$(jq -r '.updateCommit' .stratum-demo/incident-change-request.json)"
 ```
 
-## 7-Minute Script
+The agent example reads the incident evidence, runbook, and memory through the
+workspace token; writes `root-cause.md` and `remediation.md`; commits the update;
+resets `main` to the baseline; creates a real source ref; and opens a change
+request against `main`.
+
+## 15-Minute Script
 
 ### Minute 0-1: Frame the problem
 
 Say:
 
-> Most agent systems still leave behind transcripts. We want a workspace: persistent memory, inspectable files, commits, rollback, and permissioned access.
+> Most agent systems still leave behind transcripts. We want a workspace:
+> persistent memory, inspectable files, commits, rollback, and permissioned
+> access.
 
 Show health:
 
@@ -111,15 +133,21 @@ Show health:
 curl -s http://localhost:3000/health | jq
 ```
 
-Expected: `status` is `ok`, `commits` is `0` before the first demo commit,
-and `inodes` is nonzero after seeding.
+Expected: `status` is `ok`, and `inodes` is nonzero after seeding.
 
-### Minute 1-2: Show workspace state through CLI tools
+### Minute 1-3: Show workspace state through CLI tools
 
-List the incident folder as the agent:
+Load the workspace env into exported variables:
 
 ```bash
+set -a
 source .stratum-demo/incident-workspace.env
+set +a
+```
+
+List the incident folder as the scoped workspace token:
+
+```bash
 stratumctl ls /incidents/checkout-latency/
 ```
 
@@ -131,162 +159,122 @@ hypotheses.md
 timeline.md
 ```
 
-Show the whole tree:
+Show the whole tree and search for incident signals:
 
 ```bash
-source .stratum-demo/incident-workspace.env
 stratumctl tree /
-```
-
-### Minute 2-3: Let the agent inspect evidence before writing
-
-Read the runbook:
-
-```bash
-source .stratum-demo/incident-workspace.env
-stratumctl cat /runbooks/payment-service.md
-```
-
-Search for prior timeout and retry signals:
-
-```bash
-source .stratum-demo/incident-workspace.env
 stratumctl grep "timeout|retry" /
 ```
 
-Expected stdout:
-
-```text
-incidents/checkout-latency/evidence.md:6: - `payment_service_timeout_rate`: 7.4%, baseline < 0.5%
-incidents/checkout-latency/evidence.md:7: - `checkout_retry_rate`: 3.1x baseline
-incidents/checkout-latency/evidence.md:13: ERROR payment confirmation request exceeded timeout budget
-incidents/checkout-latency/hypotheses.md:5: ### 1. Payment-service timeout regression
-incidents/checkout-latency/hypotheses.md:7: Latest rollout likely changed timeout handling or retry behavior, causing checkout to block on confirmation.
-...
-runbooks/payment-service.md:9: If checkout latency spikes immediately after a payment-service deploy, inspect timeout and retry changes first.
-```
-
-`stratumctl grep` writes the match count to stderr.
-
 Narration:
 
-> The agent is using `stratumctl` against the workspace after sourcing the secure env file.
+> The agent is using `stratumctl` against a workspace-scoped token. It can inspect
+> the incident files without receiving a global admin credential.
 
-### Minute 3-4: Create new agent output
+### Minute 3-6: Let the agent create a reviewable change
 
-Write a root-cause summary:
+Run the checked-in deterministic agent example:
 
 ```bash
-source .stratum-demo/incident-workspace.env
-cat <<'EOF' | stratumctl write /incidents/checkout-latency/root-cause.md --stdin
-# Root Cause
+bun run --cwd sdk/agents example:incident | tee .stratum-demo/incident-change-request.json
 
-The most likely root cause is a payment-service timeout and retry regression introduced by the latest deploy.
-
-## Why
-
-- Evidence shows elevated confirmation timeouts.
-- Prior memory connects this pattern to payment-service rollout changes.
-- Checkout appears to be blocked on payment confirmation rather than failing independently.
-EOF
+export STRATUM_CHANGE_REQUEST_ID="$(jq -r '.changeRequestId' .stratum-demo/incident-change-request.json)"
+export STRATUM_BASELINE_COMMIT="$(jq -r '.baselineCommit' .stratum-demo/incident-change-request.json)"
+export STRATUM_UPDATE_COMMIT="$(jq -r '.updateCommit' .stratum-demo/incident-change-request.json)"
 ```
 
-Commit the investigation state:
+Point out the safe output fields:
+
+- `filesRead`: the evidence the agent inspected
+- `filesWritten`: generated incident artifacts
+- `sourceRef`: the real source ref backing the change request
+- `changeRequestId`: the review object used by the operator
+- `diffPreview`: the bounded diff preview
+
+### Minute 6-9: Review and approve
+
+Mark the generated files viewed:
 
 ```bash
-curl -s -X POST http://localhost:3000/vcs/commit \
+curl -s -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files" \
   -H "Authorization: User root" \
   -H "Content-Type: application/json" \
-  -d '{"message":"initial investigation"}' | jq
-```
+  -H "Idempotency-Key: incident-demo-view-root-cause" \
+  -d '{"path":"/incidents/checkout-latency/root-cause.md","viewed":true}' | jq
 
-Then show history:
-
-```bash
-curl -s http://localhost:3000/vcs/log \
-  -H "Authorization: User root" | jq
-```
-
-Open a change request from an existing source/session ref to `main`:
-
-```bash
-cargo run --release --bin stratumctl -- \
-  --url http://127.0.0.1:3000 \
-  --user root \
-  change-request create \
-  --session-ref agent/incident-demo/session \
-  --target-ref main \
-  --title "Incident update" \
-  --description "Agent changes from the mounted incident workspace." \
-  --idempotency-key incident-demo-cr-1
-```
-
-For the local demo, use `--user root` for admin change-request creation. In a hosted durable preview, use the repo-bound workspace bearer form with `--workspace-id`, `--workspace-token`, and `--repo` instead. If the source ref does not exist, the server returns a bounded error and `stratumctl` exits non-zero.
-
-### Minute 4-5: Show rollback
-
-Make a bad edit:
-
-```bash
-source .stratum-demo/incident-workspace.env
-cat <<'EOF' | stratumctl write /incidents/checkout-latency/root-cause.md --stdin
-# Root Cause
-
-Everything looks healthy. No action required.
-EOF
-```
-
-Commit the bad state:
-
-```bash
-curl -s -X POST http://localhost:3000/vcs/commit \
+curl -s -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files" \
   -H "Authorization: User root" \
   -H "Content-Type: application/json" \
-  -d '{"message":"bad incident conclusion"}' | jq
+  -H "Idempotency-Key: incident-demo-view-remediation" \
+  -d '{"path":"/incidents/checkout-latency/remediation.md","viewed":true}' | jq
 ```
 
-Identify the previous good hash:
+Approve as the human reviewer. This must be a different admin from the CR
+creator; the setup creates `alice` for this purpose.
 
 ```bash
-curl -s http://localhost:3000/vcs/log \
-  -H "Authorization: User root" | jq '.commits[:2]'
+curl -s -X POST "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/approvals" \
+  -H "Authorization: User alice" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: incident-demo-approve-1" \
+  -d '{"comment":"Reviewed for demo."}' | jq
 ```
 
-Revert to the earlier commit:
+### Minute 9-11: Merge and show audit evidence
+
+Merge as the operator:
 
 ```bash
-curl -s -X POST http://localhost:3000/vcs/revert \
+curl -s -X POST "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/merge" \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: incident-demo-merge-1" | jq
+```
+
+Show local audit evidence:
+
+```bash
+curl -s "$STRATUM_URL/audit?limit=25" \
+  -H "Authorization: User root" | \
+  jq '.events[] | {action, resource, route, details}'
+```
+
+Call out the file-view, approval, merge-policy, and merge audit events. Local
+audit listing is the private-beta evidence surface; hosted durable audit listing
+remains out of scope for this demo.
+
+### Minute 11-13: Revert and show rollback evidence
+
+Revert `main` back to the baseline commit captured before the agent update:
+
+```bash
+curl -s -X POST "$STRATUM_URL/vcs/revert" \
   -H "Authorization: User root" \
   -H "Content-Type: application/json" \
-  -d '{"hash":"REPLACE_WITH_PREVIOUS_HASH"}' | jq
+  -H "Idempotency-Key: incident-demo-revert-1" \
+  -d "{\"hash\":\"$STRATUM_BASELINE_COMMIT\"}" | jq
 ```
 
-Confirm the restored file:
+Show audit evidence again:
 
 ```bash
-source .stratum-demo/incident-workspace.env
-stratumctl cat /incidents/checkout-latency/root-cause.md
+curl -s "$STRATUM_URL/audit?limit=25" \
+  -H "Authorization: User root" | \
+  jq '.events[] | {action, resource, route, details}'
 ```
 
-### Minute 5-6: Show permissioned agent access
-
-Point out that the workspace is not just shared storage. It has identity and access.
-
-Use the scoped workspace token from `.stratum-demo/incident-workspace.env` for all agent reads and writes in the demo. Then show what a named human user sees:
+Confirm the restored state through the workspace:
 
 ```bash
-curl -s http://localhost:3000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"alice"}' | jq
+stratumctl ls /incidents/checkout-latency/
 ```
 
-If you want a stronger permission story, tighten permissions on one directory during setup and show a `403` response for the token user.
-
-### Minute 6-7: Close with the product statement
+### Minute 13-15: Close with the product statement
 
 Say:
 
-> This is the shift from files to workspaces. The agent did not just write output. It searched durable memory, produced inspectable artifacts, committed state, and rolled back a bad conclusion.
+> This is the shift from files to workspaces. The agent did not just write
+> output. It searched durable memory, produced inspectable artifacts, opened a
+> reviewable change, left audit evidence, and rolled back cleanly.
 
 ## Prompts To Use In Cursor
 
@@ -294,12 +282,18 @@ These are good live prompts while the shell commands are visible:
 
 - `Inspect the incident workspace before making changes. Use CLI tools first.`
 - `Search for timeout and retry evidence, then summarize the likely root cause.`
-- `Write a root-cause markdown file in the incident folder.`
-- `Commit the current investigation state with a clear message.`
-- `Now simulate a bad conclusion and show how to recover by reverting it.`
+- `Write root-cause and remediation files in the incident folder.`
+- `Open the work as a change request instead of pushing directly to main.`
+- `Show the audit trail, then roll the merged change back to the baseline.`
 
 ## Demo Notes
 
 - Use the HTTP server as the single writer during the live demo.
-- Do not run the CLI, MCP server, and HTTP server as concurrent writers against the same `state.bin`.
-- Keep the live commands grounded in the existing `stratumctl ls`, `cat`, `tree`, `grep`, and `write` surface.
+- Do not run the CLI, MCP server, and HTTP server as concurrent writers against
+  the same `state.bin`.
+- Keep hosted durable deployment out of this local demo. Use
+  `docs/durable-deployment-runbook.md` and `docs/private-beta-contract.md` for
+  hosted posture and unsupported-route evidence.
+- If `.stratum-demo/incident-workspace.env` already exists, remove
+  `.stratum-demo` and rerun from a fresh `STRATUM_DATA_DIR`; seed-demo refuses to
+  overwrite token files.

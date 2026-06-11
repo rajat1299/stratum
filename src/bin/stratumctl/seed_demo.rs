@@ -213,7 +213,9 @@ fn render_seed_demo_next_commands(env_out: &Path, command_name: &str) -> String 
     let env_out = shell_env_value(&env_out.display().to_string());
     let command_name = shell_env_value(command_name);
     format!(
-        "source {env_out}\n\
+        "set -a\n\
+         source {env_out}\n\
+         set +a\n\
          {command_name} tree /\n\
          {command_name} grep timeout /\n\
          {command_name} write /incidents/checkout-latency/root-cause.md --stdin\n"
@@ -451,7 +453,7 @@ mod tests {
             "stratumctl",
         );
 
-        assert!(output.contains("source '.stratum-demo/incident-workspace.env'"));
+        assert!(output.contains("set -a\nsource '.stratum-demo/incident-workspace.env'\nset +a"));
         assert!(output.contains("'stratumctl' tree /"));
         assert!(output.contains("'stratumctl' grep timeout /"));
         assert!(
@@ -469,7 +471,7 @@ mod tests {
             "/tmp/stratum ctl",
         );
 
-        assert!(output.contains("source '.stratum demo/incident env'"));
+        assert!(output.contains("set -a\nsource '.stratum demo/incident env'\nset +a"));
         assert!(output.contains("'/tmp/stratum ctl' tree /"));
     }
 

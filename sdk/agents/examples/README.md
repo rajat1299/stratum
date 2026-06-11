@@ -7,7 +7,9 @@ This example runs after `stratumctl workspace seed-demo`. It reads the seeded in
 Start `stratum-server`, run the seed demo, then:
 
 ```bash
+set -a
 source .stratum-demo/incident-workspace.env
+set +a
 bun run --cwd sdk/agents example:incident
 ```
 
