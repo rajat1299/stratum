@@ -34,6 +34,7 @@ impl Default for FsOptions {
 
 #[derive(Debug, Clone, Default)]
 pub struct MetadataUpdate {
+    pub mode: Option<u16>,
     pub mime_type: Option<Option<String>>,
     pub custom_attrs: BTreeMap<String, String>,
     pub remove_custom_attrs: Vec<String>,
@@ -42,8 +43,10 @@ pub struct MetadataUpdate {
 #[derive(Debug, Clone, Default)]
 pub struct MetadataUpdateResult {
     pub changed: bool,
+    pub mode: u16,
     pub mime_type: Option<String>,
     pub custom_attrs: BTreeMap<String, String>,
+    pub mode_changed: bool,
     pub mime_type_changed: bool,
     pub custom_attrs_set: Vec<String>,
     pub custom_attrs_removed: Vec<String>,
@@ -877,8 +880,16 @@ impl VirtualFs {
 
         let id = self.resolve_path(path)?;
         let inode = self.get_inode_mut(id)?;
+        let old_mode = inode.mode;
         let old_mime_type = inode.mime_type.clone();
         let old_custom_attrs = inode.custom_attrs.clone();
+
+        let mode = update.mode.unwrap_or(old_mode);
+        if mode > 0o7777 {
+            return Err(VfsError::InvalidArgs {
+                message: format!("invalid mode: 0{mode:o}"),
+            });
+        }
 
         let mut mime_type = old_mime_type.clone();
         if let Some(next_mime_type) = update.mime_type {
@@ -894,6 +905,7 @@ impl VirtualFs {
         }
         validate_custom_attrs(&custom_attrs)?;
 
+        let mode_changed = old_mode != mode;
         let mime_type_changed = old_mime_type != mime_type;
         let custom_attrs_set = update
             .custom_attrs
@@ -912,8 +924,9 @@ impl VirtualFs {
         }
 
         let custom_attrs_changed = old_custom_attrs != custom_attrs;
-        let changed = mime_type_changed || custom_attrs_changed;
+        let changed = mode_changed || mime_type_changed || custom_attrs_changed;
         if changed {
+            inode.mode = mode;
             inode.mime_type = mime_type.clone();
             inode.custom_attrs = custom_attrs.clone();
             inode.touch_change();
@@ -921,8 +934,10 @@ impl VirtualFs {
 
         Ok(MetadataUpdateResult {
             changed,
+            mode,
             mime_type,
             custom_attrs,
+            mode_changed,
             mime_type_changed,
             custom_attrs_set,
             custom_attrs_removed,

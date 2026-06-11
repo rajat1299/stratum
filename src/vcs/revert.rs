@@ -59,6 +59,7 @@ fn restore_dir(
         fs.set_metadata(
             &child_path,
             MetadataUpdate {
+                mode: None,
                 mime_type: Some(entry.mime_type.clone()),
                 custom_attrs: entry.custom_attrs.clone(),
                 remove_custom_attrs: Vec::new(),

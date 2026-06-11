@@ -68,6 +68,7 @@ struct SeedDemoEnvVars<'a> {
     url: &'a str,
     workspace_id: Uuid,
     workspace_token: &'a str,
+    workspace_root: &'a str,
     repo: Option<&'a str>,
 }
 
@@ -134,6 +135,10 @@ fn seed_demo_env_contents(vars: SeedDemoEnvVars<'_>) -> String {
     contents.push_str(&format!(
         "STRATUM_WORKSPACE_TOKEN={}\n",
         shell_env_value(vars.workspace_token)
+    ));
+    contents.push_str(&format!(
+        "STRATUM_WORKSPACE_ROOT={}\n",
+        shell_env_value(vars.workspace_root)
     ));
     if let Some(repo) = vars.repo {
         contents.push_str(&format!("STRATUM_REPO={}\n", shell_env_value(repo)));
@@ -282,6 +287,9 @@ pub(crate) async fn run_workspace_seed_demo(
         )
         .await?;
     admin_client.mkdir_p(&options.root_path).await?;
+    admin_client
+        .patch_metadata_mode(&options.root_path, 0o777)
+        .await?;
 
     let issued = admin_client
         .issue_scoped_workspace_token_parsed(
@@ -297,6 +305,7 @@ pub(crate) async fn run_workspace_seed_demo(
         url: &context.url,
         workspace_id: workspace.id,
         workspace_token: &issued.workspace_token,
+        workspace_root: &options.root_path,
         repo: context.repo.as_deref(),
     }) {
         let _ = admin_client
@@ -422,6 +431,7 @@ mod tests {
                 url: "http://127.0.0.1:3000",
                 workspace_id,
                 workspace_token: "issued-workspace-secret",
+                workspace_root: "/demo/incident-workspace",
                 repo: Some("tenant-a"),
             },
         )
@@ -431,6 +441,7 @@ mod tests {
         assert!(contents.contains("STRATUM_URL='http://127.0.0.1:3000'"));
         assert!(contents.contains(&format!("STRATUM_WORKSPACE_ID='{workspace_id}'")));
         assert!(contents.contains("STRATUM_WORKSPACE_TOKEN='issued-workspace-secret'"));
+        assert!(contents.contains("STRATUM_WORKSPACE_ROOT='/demo/incident-workspace'"));
         assert!(contents.contains("STRATUM_REPO='tenant-a'"));
         assert!(!contents.contains("backing-agent-secret"));
 
@@ -490,6 +501,7 @@ mod tests {
                 url: "http://127.0.0.1:3000",
                 workspace_id: Uuid::new_v4(),
                 workspace_token: "issued-workspace-secret",
+                workspace_root: "/demo/incident-workspace",
                 repo: None,
             },
         )
@@ -514,6 +526,9 @@ mod tests {
         let created_dirs_for_handler = created_dirs.clone();
         let workspace_root_created = Arc::new(Mutex::new(false));
         let workspace_root_created_for_handler = workspace_root_created.clone();
+        let workspace_root_chmodded = Arc::new(Mutex::new(false));
+        let workspace_root_chmodded_for_put = workspace_root_chmodded.clone();
+        let workspace_root_chmodded_for_patch = workspace_root_chmodded.clone();
         let app = Router::new()
             .route(
                 "/v1/capabilities",
@@ -598,6 +613,12 @@ mod tests {
                                 Json(serde_json::json!({ "error": "missing workspace root" })),
                             );
                         }
+                        if !*workspace_root_chmodded_for_put.lock().unwrap() {
+                            return (
+                                axum::http::StatusCode::FORBIDDEN,
+                                Json(serde_json::json!({ "error": "workspace root mode not writable" })),
+                            );
+                        }
                         if headers
                             .get("x-stratum-type")
                             .and_then(|value| value.to_str().ok())
@@ -624,6 +645,39 @@ mod tests {
                             axum::http::StatusCode::OK,
                             Json(serde_json::json!({ "path": path, "bytes": body.len() })),
                         )
+                    },
+                )
+                .patch(
+                    move |Path(path): Path<String>,
+                          headers: axum::http::HeaderMap,
+                          Json(body): Json<serde_json::Value>| {
+                        let workspace_root_chmodded = workspace_root_chmodded_for_patch.clone();
+                        async move {
+                            let path = format!("/{}", path.trim_start_matches('/'));
+                            if headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                == Some("User root")
+                                && path == DEFAULT_SEED_ROOT_PATH
+                                && body.get("mode").and_then(|value| value.as_str())
+                                    == Some("0777")
+                            {
+                                *workspace_root_chmodded.lock().unwrap() = true;
+                                return (
+                                    axum::http::StatusCode::OK,
+                                    Json(serde_json::json!({
+                                        "metadata_updated": path,
+                                        "changed": true,
+                                        "mode": "0777",
+                                        "mode_changed": true
+                                    })),
+                                );
+                            }
+                            (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({ "error": "unexpected metadata patch" })),
+                            )
+                        }
                     },
                 ),
             )
@@ -660,6 +714,7 @@ mod tests {
         assert!(stdout.contains("source "));
         assert!(stdout.contains("'stratumctl' tree /"));
         assert!(*workspace_root_created.lock().unwrap());
+        assert!(*workspace_root_chmodded.lock().unwrap());
         assert!(
             created_dirs
                 .lock()
@@ -960,6 +1015,34 @@ mod tests {
                         (
                             axum::http::StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({ "error": "seed write failed" })),
+                        )
+                    },
+                )
+                .patch(
+                    move |Path(path): Path<String>,
+                          headers: axum::http::HeaderMap,
+                          Json(body): Json<serde_json::Value>| async move {
+                        if headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("User root")
+                            && path.trim_start_matches('/')
+                                == DEFAULT_SEED_ROOT_PATH.trim_start_matches('/')
+                            && body.get("mode").and_then(|value| value.as_str()) == Some("0777")
+                        {
+                            return (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "metadata_updated": DEFAULT_SEED_ROOT_PATH,
+                                    "changed": true,
+                                    "mode": "0777",
+                                    "mode_changed": true
+                                })),
+                            );
+                        }
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": "unexpected metadata patch" })),
                         )
                     },
                 ),

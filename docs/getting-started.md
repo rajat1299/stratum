@@ -161,8 +161,9 @@ Admin username: alice
 
 alice@stratum:~ $ su root
 root@stratum:~ $ addagent incident-bot
-Created agent: incident-bot (uid=2)
-Token: REPLACE_WITH_REAL_TOKEN
+Agent 'incident-bot' created (uid=2)
+API token (save this — shown only once):
+  REPLACE_WITH_REAL_TOKEN
 root@stratum:~ $ exit
 ```
 
@@ -200,8 +201,16 @@ bun run --cwd sdk/agents example:incident | tee .stratum-demo/incident-change-re
 export STRATUM_CHANGE_REQUEST_ID="$(jq -r '.changeRequestId' .stratum-demo/incident-change-request.json)"
 export STRATUM_BASELINE_COMMIT="$(jq -r '.baselineCommit' .stratum-demo/incident-change-request.json)"
 export STRATUM_UPDATE_COMMIT="$(jq -r '.updateCommit' .stratum-demo/incident-change-request.json)"
+export STRATUM_REVIEW_PATHS="$(jq -r '.reviewPaths[]' .stratum-demo/incident-change-request.json)"
 
-curl -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files"
+while IFS= read -r review_path; do
+  curl -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files" \
+    -H "Authorization: User root" \
+    -H "Content-Type: application/json" \
+    --data "$(jq -cn --arg path "$review_path" '{path:$path, viewed:true}')"
+done <<EOF
+$STRATUM_REVIEW_PATHS
+EOF
 curl -X POST "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/approvals"
 curl -X POST "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/merge"
 curl "$STRATUM_URL/audit?limit=25"

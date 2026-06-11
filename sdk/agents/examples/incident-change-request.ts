@@ -24,6 +24,7 @@ export interface IncidentExampleConfig {
   readonly workspaceId: string;
   readonly workspaceToken: string;
   readonly repoId?: string;
+  readonly workspaceRoot?: string;
   readonly adminUser: string;
   readonly adapter: "openai-agents";
   readonly planner: "deterministic";
@@ -56,6 +57,7 @@ export interface IncidentExampleResult {
   readonly planner: "deterministic";
   readonly filesRead: readonly string[];
   readonly filesWritten: readonly string[];
+  readonly reviewPaths: readonly string[];
   readonly baselineCommit: string;
   readonly updateCommit: string;
   readonly sourceRef: string;
@@ -87,6 +89,21 @@ function findMainRef(refs: readonly StratumRef[]): StratumRef {
   return main;
 }
 
+function normalizeWorkspaceRoot(root: string | undefined): string | undefined {
+  if (root === undefined) return undefined;
+  const trimmed = root.trim();
+  if (trimmed === "") return undefined;
+  if (!trimmed.startsWith("/")) {
+    throw new Error("STRATUM_WORKSPACE_ROOT must be an absolute VFS path");
+  }
+  return trimmed === "/" ? "" : trimmed.replace(/\/+$/u, "");
+}
+
+function reviewPathForWorkspacePath(workspaceRoot: string | undefined, path: string): string {
+  const normalizedRoot = normalizeWorkspaceRoot(workspaceRoot);
+  return normalizedRoot === undefined ? path : `${normalizedRoot}${path}`;
+}
+
 function withRepoHeader(fetchImpl: typeof fetch, repoId: string): typeof fetch {
   return async (input, init) => {
     const request = new Request(input, init);
@@ -115,6 +132,7 @@ export function loadIncidentExampleConfig(input: NodeJS.ProcessEnv = process.env
   const workspaceId = requiredEnv(input, "STRATUM_WORKSPACE_ID");
   const workspaceToken = requiredEnv(input, "STRATUM_WORKSPACE_TOKEN");
   const repoId = input.STRATUM_REPO?.trim() || undefined;
+  const workspaceRoot = normalizeWorkspaceRoot(input.STRATUM_WORKSPACE_ROOT);
   const adminUser = input.STRATUM_ADMIN_USER?.trim() || "root";
 
   const publicConfig = {
@@ -130,6 +148,7 @@ export function loadIncidentExampleConfig(input: NodeJS.ProcessEnv = process.env
     baseUrl,
     workspaceId,
     workspaceToken,
+    ...(workspaceRoot !== undefined ? { workspaceRoot } : {}),
     repoId,
     adminUser,
     adapter: "openai-agents",
@@ -283,6 +302,9 @@ async function runIncidentChangeRequestExampleWithConfig(
 
   const editor = new StratumEditor(workspace);
   const filesWritten = await applyPatchPlan(editor, plan.operations);
+  const reviewPaths = filesWritten.map((path) =>
+    reviewPathForWorkspacePath(config.workspaceRoot, path),
+  );
 
   await adminClient.vcs.commit(plan.title);
 
@@ -306,7 +328,7 @@ async function runIncidentChangeRequestExampleWithConfig(
     target_ref: TARGET_REF,
   });
 
-  const diff = await adminClient.vcs.diff({ base: TARGET_REF, head: sourceRef });
+  const diff = await adminClient.vcs.diff({ base: baselineCommit, head: updateCommit });
   const diffPreview = diff.slice(0, 1200);
 
   return {
@@ -315,6 +337,7 @@ async function runIncidentChangeRequestExampleWithConfig(
     planner: config.planner,
     filesRead,
     filesWritten,
+    reviewPaths,
     baselineCommit,
     updateCommit,
     sourceRef,

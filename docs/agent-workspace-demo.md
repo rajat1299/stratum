@@ -57,8 +57,9 @@ Then create the backing agent token:
 ```text
 alice@stratum:~ $ su root
 root@stratum:~ $ addagent incident-bot
-Created agent: incident-bot (uid=2)
-Token: REPLACE_WITH_REAL_TOKEN
+Agent 'incident-bot' created (uid=2)
+API token (save this — shown only once):
+  REPLACE_WITH_REAL_TOKEN
 root@stratum:~ $ exit
 ```
 
@@ -92,6 +93,8 @@ export STRATUM_REVIEWER_USER=alice
 The script creates `.stratum-demo/incident-workspace.env` with `chmod 600`,
 sources it with auto-export, runs the checked-in agent example, and writes
 `.stratum-demo/incident-change-request.json`. No raw workspace token is printed.
+The env file includes `STRATUM_WORKSPACE_ROOT`, which the example uses to return
+review paths that match the change request's backing changed paths.
 
 If you want to run the core commands manually, use the same sequence:
 
@@ -110,6 +113,7 @@ bun run --cwd sdk/agents example:incident | tee .stratum-demo/incident-change-re
 export STRATUM_CHANGE_REQUEST_ID="$(jq -r '.changeRequestId' .stratum-demo/incident-change-request.json)"
 export STRATUM_BASELINE_COMMIT="$(jq -r '.baselineCommit' .stratum-demo/incident-change-request.json)"
 export STRATUM_UPDATE_COMMIT="$(jq -r '.updateCommit' .stratum-demo/incident-change-request.json)"
+export STRATUM_REVIEW_PATHS="$(jq -r '.reviewPaths[]' .stratum-demo/incident-change-request.json)"
 ```
 
 The agent example reads the incident evidence, runbook, and memory through the
@@ -187,6 +191,7 @@ Point out the safe output fields:
 
 - `filesRead`: the evidence the agent inspected
 - `filesWritten`: generated incident artifacts
+- `reviewPaths`: exact changed paths to mark viewed on the change request
 - `sourceRef`: the real source ref backing the change request
 - `changeRequestId`: the review object used by the operator
 - `diffPreview`: the bounded diff preview
@@ -196,17 +201,15 @@ Point out the safe output fields:
 Mark the generated files viewed:
 
 ```bash
-curl -s -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files" \
-  -H "Authorization: User root" \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: incident-demo-view-root-cause" \
-  -d '{"path":"/incidents/checkout-latency/root-cause.md","viewed":true}' | jq
-
-curl -s -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files" \
-  -H "Authorization: User root" \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: incident-demo-view-remediation" \
-  -d '{"path":"/incidents/checkout-latency/remediation.md","viewed":true}' | jq
+while IFS= read -r review_path; do
+  curl -s -X PUT "$STRATUM_URL/change-requests/$STRATUM_CHANGE_REQUEST_ID/viewed-files" \
+    -H "Authorization: User root" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: incident-demo-view-${review_path//[^A-Za-z0-9]/-}" \
+    -d "$(jq -cn --arg path "$review_path" '{path:$path, viewed:true}')" | jq
+done <<EOF
+$STRATUM_REVIEW_PATHS
+EOF
 ```
 
 Approve as the human reviewer. This must be a different admin from the CR

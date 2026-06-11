@@ -6801,6 +6801,7 @@ mod tests {
             DurableMutationOperation::SetMetadata {
                 path: "/demo/meta.txt".to_string(),
                 update: MetadataUpdate {
+                    mode: None,
                     mime_type: Some(Some("text/plain".to_string())),
                     custom_attrs: BTreeMap::from([("reviewed".to_string(), "true".to_string())]),
                     remove_custom_attrs: Vec::new(),
@@ -7126,6 +7127,7 @@ mod tests {
             DurableMutationOperation::SetMetadata {
                 path: "/demo/meta.txt".to_string(),
                 update: MetadataUpdate {
+                    mode: None,
                     mime_type: None,
                     custom_attrs: BTreeMap::from([("reviewed".to_string(), "true".to_string())]),
                     remove_custom_attrs: Vec::new(),

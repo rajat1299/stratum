@@ -32,7 +32,9 @@ The private-beta durable posture uses:
 This repository currently contains the Stratum runtime, provider gates, and
 operator checks. It does not contain a checked-in Cloudflare deploy manifest.
 Keep Cloudflare account/project configuration in operator-controlled
-infrastructure until Task 16 release rehearsal records an exact deploy path.
+infrastructure. Task 16 recorded the local release rehearsal; hosted durable
+release rehearsal remains pending on an operator-provisioned deploy target,
+repo-bound hosted admin bearer, and Cloudflare/Postgres/R2 credentials.
 
 Out of scope for this runbook: hosted durable audit listing, hosted `/runs`,
 hosted `/execute`, VCS recovery operator routes under durable-cloud, semantic

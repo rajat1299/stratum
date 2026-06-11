@@ -184,6 +184,7 @@ describe("incident adapter example", () => {
         STRATUM_WORKSPACE_ID: "11111111-1111-1111-1111-111111111111",
         STRATUM_WORKSPACE_TOKEN: "workspace-secret",
         STRATUM_REPO: "tenant-a",
+        STRATUM_WORKSPACE_ROOT: "/demo/incident-workspace",
       },
       fetch: fetchImpl,
       now: () => new Date("2026-06-10T00:00:00Z"),
@@ -196,6 +197,10 @@ describe("incident adapter example", () => {
     expect(result.filesWritten).toEqual([
       "/incidents/checkout-latency/root-cause.md",
       "/incidents/checkout-latency/remediation.md",
+    ]);
+    expect(result.reviewPaths).toEqual([
+      "/demo/incident-workspace/incidents/checkout-latency/root-cause.md",
+      "/demo/incident-workspace/incidents/checkout-latency/remediation.md",
     ]);
     expect(JSON.stringify(result)).not.toContain("workspace-secret");
 
@@ -213,6 +218,11 @@ describe("incident adapter example", () => {
     const adminRequests = requests.filter((request) => new URL(request.url).pathname.startsWith("/vcs") || new URL(request.url).pathname.startsWith("/change-requests"));
     expect(adminRequests.every((request) => request.headers.get("Authorization") === "User root")).toBe(true);
     expect(adminRequests.every((request) => request.headers.get("X-Stratum-Repo") === "tenant-a")).toBe(true);
+
+    const diffRequest = requests.find((request) => new URL(request.url).pathname === "/vcs/diff");
+    expect(diffRequest).toBeDefined();
+    expect(new URL(diffRequest!.url).searchParams.get("base")).toBe(baseline);
+    expect(new URL(diffRequest!.url).searchParams.get("head")).toBe(update);
 
     for (const request of requests) {
       expect(request.url).not.toContain("workspace-secret");

@@ -69,6 +69,8 @@ export STRATUM_UPDATE_COMMIT
 STRATUM_CHANGE_REQUEST_ID="$(json_field changeRequestId)"
 STRATUM_BASELINE_COMMIT="$(json_field baselineCommit)"
 STRATUM_UPDATE_COMMIT="$(json_field updateCommit)"
+STRATUM_REVIEW_PATHS="$(jq -r '.reviewPaths[]?' "$STRATUM_DEMO_RESULT")"
+[[ -n "$STRATUM_REVIEW_PATHS" ]] || fail "missing reviewPaths in ${STRATUM_DEMO_RESULT}"
 
 repo_header=()
 if [[ -n "${STRATUM_REPO:-}" ]]; then
@@ -82,7 +84,7 @@ api_url() {
 put_viewed_file() {
   local path="$1"
   curl -fsS -X PUT "$(api_url "/change-requests/${STRATUM_CHANGE_REQUEST_ID}/viewed-files")" \
-    "${repo_header[@]}" \
+    ${repo_header[@]+"${repo_header[@]}"} \
     -H "Authorization: User ${STRATUM_ADMIN_USER}" \
     -H "Content-Type: application/json" \
     -H "Idempotency-Key: local-golden-path-viewed-${path//[^A-Za-z0-9]/-}" \
@@ -90,12 +92,16 @@ put_viewed_file() {
 }
 
 printf 'Marking generated files viewed on change request %s...\n' "$STRATUM_CHANGE_REQUEST_ID"
-put_viewed_file "/incidents/checkout-latency/root-cause.md"
-put_viewed_file "/incidents/checkout-latency/remediation.md"
+while IFS= read -r review_path; do
+  [[ -n "$review_path" ]] || continue
+  put_viewed_file "$review_path"
+done <<EOF
+$STRATUM_REVIEW_PATHS
+EOF
 
 printf 'Approving as %s...\n' "$STRATUM_REVIEWER_USER"
 curl -fsS -X POST "$(api_url "/change-requests/${STRATUM_CHANGE_REQUEST_ID}/approvals")" \
-  "${repo_header[@]}" \
+  ${repo_header[@]+"${repo_header[@]}"} \
   -H "Authorization: User ${STRATUM_REVIEWER_USER}" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: local-golden-path-approve-1" \
@@ -103,7 +109,7 @@ curl -fsS -X POST "$(api_url "/change-requests/${STRATUM_CHANGE_REQUEST_ID}/appr
 
 printf 'Merging as %s...\n' "$STRATUM_ADMIN_USER"
 curl -fsS -X POST "$(api_url "/change-requests/${STRATUM_CHANGE_REQUEST_ID}/merge")" \
-  "${repo_header[@]}" \
+  ${repo_header[@]+"${repo_header[@]}"} \
   -H "Authorization: User ${STRATUM_ADMIN_USER}" \
   -H "Idempotency-Key: local-golden-path-merge-1" | jq
 
@@ -114,7 +120,7 @@ curl -fsS "$(api_url "/audit?limit=25")" \
 
 printf 'Reverting main to baseline commit %s...\n' "$STRATUM_BASELINE_COMMIT"
 curl -fsS -X POST "$(api_url "/vcs/revert")" \
-  "${repo_header[@]}" \
+  ${repo_header[@]+"${repo_header[@]}"} \
   -H "Authorization: User ${STRATUM_ADMIN_USER}" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: local-golden-path-revert-1" \

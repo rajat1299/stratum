@@ -940,6 +940,14 @@ impl StratumDb {
         let id = guard.fs.resolve_path_checked(path, session)?;
         require_access(&guard.fs, id, session, Access::Write, path)?;
         let metadata_path = checked_final_path(&guard.fs, path, session, Access::Write)?;
+        if update.mode.is_some() {
+            let stat = guard.fs.stat(&metadata_path)?;
+            if !session.is_effective_owner(stat.uid) {
+                return Err(VfsError::PermissionDenied {
+                    path: path.to_string(),
+                });
+            }
+        }
 
         let result = guard.fs.set_metadata(&metadata_path, update)?;
         drop(guard);

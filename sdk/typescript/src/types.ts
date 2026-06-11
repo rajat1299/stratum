@@ -70,6 +70,7 @@ export interface StratumMkdirResult {
 }
 
 export interface StratumMetadataPatch {
+  readonly mode?: string;
   readonly mime_type?: string | null;
   readonly custom_attrs?: Record<string, string>;
   readonly remove_custom_attrs?: readonly string[];
@@ -78,6 +79,8 @@ export interface StratumMetadataPatch {
 export interface StratumMetadataPatchResult {
   readonly metadata_updated: string;
   readonly changed: boolean;
+  readonly mode: string;
+  readonly mode_changed: boolean;
   readonly mime_type: string | null;
   readonly custom_attr_keys: readonly string[];
   readonly custom_attrs_set: readonly string[];

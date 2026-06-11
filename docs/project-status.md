@@ -7,11 +7,50 @@
 - Latest completed backend slice: Conformance Test Scaffolding (Slice 24)
 - Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
 - Latest completed SDK slice: SDK beta publishing readiness (`docs/plans/2026-06-11-sdk-beta-publishing.md`)
-- Latest completed private-beta closeout task: Product docs and demo script (`docs/plans/2026-06-11-product-docs-demo-script.md`)
+- Latest private-beta closeout task: Release rehearsal HITL (`docs/plans/2026-06-11-release-rehearsal-hitl.md`); local-state rehearsal passed, hosted durable rehearsal remains blocked on operator credentials/deploy target.
 - Postgres semantic search shipped for durable-cloud (`GET /search/semantic`, SDK `search.semantic`): Slice 20 adds FTS state/files (migration 0019); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); Slice 23 adds pgvector ranking as an additive derived index (migration 0022) with disabled-by-default providers and FTS fallback.
 - Planned next SDK slice: optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Task 16 / Release Rehearsal HITL
+
+Delivered from `docs/plans/2026-06-11-release-rehearsal-hitl.md`.
+
+Completed scope:
+
+- Ran the full local-state private-beta golden path in a throwaway
+  `/tmp/stratum-release-rehearsal.*` data directory: admin setup, backing agent
+  token, server, seed-demo, checked-in agent change request, file-view evidence,
+  approval, merge, audit evidence, revert, and post-revert audit evidence.
+- Kept token-bearing setup logs in `/tmp` and removed them through the rehearsal
+  cleanup trap.
+- Fixed rehearsal blockers found during the live pass: seed-demo now chmods the
+  demo workspace root for scoped writes, the incident example requests diff
+  preview by concrete commit IDs, the example returns exact `reviewPaths` for
+  file-view evidence, and the Bash script handles empty optional repo headers
+  under `set -u`.
+- Updated demo docs to match the actual `addagent` token transcript and
+  `reviewPaths` flow.
+- Recorded hosted durable rehearsal as blocked rather than simulated: no
+  operator-provisioned Cloudflare deploy target, Postgres/R2 credentials,
+  tenant/repo context, or repo-bound hosted admin bearer were available in this
+  session.
+
+Focused verification:
+
+- Full temp local rehearsal passed with `scripts/run-local-golden-path-demo.sh`.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task16 cargo test --locked metadata_patch --lib -- --nocapture` passed **2** tests.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task16 cargo test --locked patch_fs_metadata_is_idempotent_and_audited_without_attr_values --lib -- --nocapture` passed **1** test.
+- `CARGO_TARGET_DIR=/tmp/stratum-target-task16 cargo test --locked seed_demo_ --bin stratumctl -- --nocapture` passed **14** tests.
+- `bun run --cwd sdk/agents test:run -- incident-example.test.ts` passed **4** tests.
+- `bun run --cwd sdk/typescript typecheck` passed.
+- `uv run --project sdk/python pytest sdk/python/tests/test_client.py -q` passed
+  **21** tests.
+- `bash -n scripts/check-getting-started-golden-path-doc.sh scripts/run-local-golden-path-demo.sh` passed.
+- `./scripts/check-getting-started-golden-path-doc.sh` passed.
+- `cargo fmt --all -- --check` passed.
+- `git diff --check` passed.
 
 ## Task 15 / Product Docs And Demo Script
 

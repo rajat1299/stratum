@@ -3279,11 +3279,14 @@ fn metadata_update_result_from_stats(
         }
     }
     let mime_type_changed = before.mime_type != after.mime_type;
+    let mode_changed = before.mode != after.mode;
     let custom_attrs_changed = before.custom_attrs != after.custom_attrs;
     MetadataUpdateResult {
-        changed: mime_type_changed || custom_attrs_changed,
+        changed: mode_changed || mime_type_changed || custom_attrs_changed,
+        mode: after.mode,
         mime_type: after.mime_type.clone(),
         custom_attrs: after.custom_attrs.clone(),
+        mode_changed,
         mime_type_changed,
         custom_attrs_set,
         custom_attrs_removed,

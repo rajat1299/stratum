@@ -292,6 +292,25 @@ impl StratumClient {
         .await
     }
 
+    pub async fn patch_metadata_mode(
+        &self,
+        path: &str,
+        mode: u16,
+    ) -> Result<serde_json::Value, VfsError> {
+        if mode > 0o7777 {
+            return Err(VfsError::InvalidArgs {
+                message: format!("invalid mode: 0{mode:o}"),
+            });
+        }
+        let url = format!("{}/fs/{}", self.base_url, path.trim_start_matches('/'));
+        self.json(
+            self.client
+                .patch(url)
+                .json(&serde_json::json!({ "mode": format!("0{mode:o}") })),
+        )
+        .await
+    }
+
     pub async fn grep(
         &self,
         pattern: &str,

@@ -68,6 +68,8 @@ pub struct SemanticSearchQuery {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct MetadataPatchRequest {
+    #[serde(default, deserialize_with = "deserialize_mode_patch")]
+    mode: Option<u16>,
     #[serde(default, deserialize_with = "deserialize_mime_type_patch")]
     mime_type: Option<Option<String>>,
     #[serde(default)]
@@ -90,9 +92,42 @@ where
     }
 }
 
+fn parse_octal_mode(value: &str) -> Result<u16, String> {
+    let trimmed = value
+        .strip_prefix("0o")
+        .or_else(|| value.strip_prefix("0O"))
+        .unwrap_or(value);
+    if trimmed.is_empty() || trimmed.len() > 4 || !trimmed.chars().all(|ch| matches!(ch, '0'..='7'))
+    {
+        return Err("mode must be an octal string between 0000 and 7777".to_string());
+    }
+    let mode = u16::from_str_radix(trimmed, 8)
+        .map_err(|_| "mode must be an octal string between 0000 and 7777".to_string())?;
+    if mode > 0o7777 {
+        return Err("mode must be an octal string between 0000 and 7777".to_string());
+    }
+    Ok(mode)
+}
+
+fn deserialize_mode_patch<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(value) => parse_octal_mode(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "mode must be an octal string between 0000 and 7777",
+        )),
+    }
+}
+
 impl From<MetadataPatchRequest> for MetadataUpdate {
     fn from(request: MetadataPatchRequest) -> Self {
         Self {
+            mode: request.mode,
             mime_type: request.mime_type,
             custom_attrs: request.custom_attrs,
             remove_custom_attrs: request.remove_custom_attrs,
@@ -426,12 +461,17 @@ fn stat_to_json(info: &crate::fs::StatInfo) -> serde_json::Value {
 }
 
 fn metadata_request_fingerprint_json(request: &MetadataPatchRequest) -> serde_json::Value {
+    let mode = match request.mode {
+        None => serde_json::json!({"op": "absent"}),
+        Some(value) => serde_json::json!({"op": "set", "value": format!("0{value:o}")}),
+    };
     let mime_type = match &request.mime_type {
         None => serde_json::json!({"op": "absent"}),
         Some(None) => serde_json::json!({"op": "clear"}),
         Some(Some(value)) => serde_json::json!({"op": "set", "value": value}),
     };
     serde_json::json!({
+        "mode": mode,
         "mime_type": mime_type,
         "custom_attrs": request.custom_attrs,
         "remove_custom_attrs": request.remove_custom_attrs,
@@ -1998,6 +2038,8 @@ async fn patch_fs(
             let body = serde_json::json!({
                 "metadata_updated": project_path,
                 "changed": result.changed,
+                "mode": format!("0{:o}", result.mode),
+                "mode_changed": result.mode_changed,
                 "mime_type": result.mime_type,
                 "custom_attr_keys": custom_attr_keys,
                 "custom_attrs_set": result.custom_attrs_set,
@@ -2023,6 +2065,7 @@ async fn patch_fs(
                     AuditResource::path(AuditResourceKind::Path, &path),
                 )
                 .with_detail("project_path", &project_path)
+                .with_detail("mode_changed", result.mode_changed)
                 .with_detail("mime_type_changed", result.mime_type_changed)
                 .with_detail("custom_attrs_set", result.custom_attrs_set.join(","))
                 .with_detail(
@@ -6279,6 +6322,7 @@ mod tests {
             Path("/write/existing.txt".to_string()),
             headers.clone(),
             Json(MetadataPatchRequest {
+                mode: None,
                 mime_type: Some(Some("text/plain".to_string())),
                 custom_attrs: BTreeMap::new(),
                 remove_custom_attrs: Vec::new(),
@@ -7169,6 +7213,7 @@ mod tests {
             Path("scratch/final.txt".to_string()),
             with_idempotency_key(headers.clone(), "durable-fs-metadata"),
             Json(MetadataPatchRequest {
+                mode: None,
                 mime_type: Some(Some("text/plain".to_string())),
                 custom_attrs: BTreeMap::from([("reviewed".to_string(), "true".to_string())]),
                 remove_custom_attrs: Vec::new(),
@@ -7558,6 +7603,22 @@ mod tests {
         assert_eq!(set.mime_type, Some(Some("text/plain".to_string())));
     }
 
+    #[test]
+    fn metadata_patch_request_parses_octal_mode() {
+        let request: MetadataPatchRequest =
+            serde_json::from_value(serde_json::json!({"mode": "0777"})).unwrap();
+        assert_eq!(request.mode, Some(0o777));
+
+        let prefixed: MetadataPatchRequest =
+            serde_json::from_value(serde_json::json!({"mode": "0o755"})).unwrap();
+        assert_eq!(prefixed.mode, Some(0o755));
+
+        let invalid =
+            serde_json::from_value::<MetadataPatchRequest>(serde_json::json!({"mode": "0888"}))
+                .expect_err("mode must be octal");
+        assert!(invalid.to_string().contains("mode must be an octal string"));
+    }
+
     #[tokio::test]
     async fn raw_get_uses_symlink_target_mime_type() {
         let db = StratumDb::open_memory();
@@ -7617,6 +7678,7 @@ mod tests {
             Path("/metadata.txt".to_string()),
             headers.clone(),
             Json(MetadataPatchRequest {
+                mode: Some(0o600),
                 mime_type: Some(Some("text/plain".to_string())),
                 custom_attrs: attrs.clone(),
                 remove_custom_attrs: Vec::new(),
@@ -7630,6 +7692,11 @@ mod tests {
             first_body.get("custom_attr_keys"),
             Some(&serde_json::json!(["owner"]))
         );
+        assert_eq!(first_body.get("mode"), Some(&serde_json::json!("0600")));
+        assert_eq!(
+            first_body.get("mode_changed"),
+            Some(&serde_json::json!(true))
+        );
         assert_body_redacted(&serde_json::to_string(&first_body).unwrap(), &["docs"]);
 
         let replay = patch_fs(
@@ -7637,6 +7704,7 @@ mod tests {
             Path("/metadata.txt".to_string()),
             headers,
             Json(MetadataPatchRequest {
+                mode: Some(0o600),
                 mime_type: Some(Some("text/plain".to_string())),
                 custom_attrs: attrs,
                 remove_custom_attrs: Vec::new(),
@@ -7656,6 +7724,7 @@ mod tests {
             .stat_as("/metadata.txt", &Session::root())
             .await
             .unwrap();
+        assert_eq!(stat.mode, 0o600);
         assert_eq!(stat.mime_type.as_deref(), Some("text/plain"));
         assert_eq!(
             stat.custom_attrs.get("owner").map(String::as_str),
@@ -7834,6 +7903,7 @@ mod tests {
             Path("/legal/existing.txt".to_string()),
             workspace_headers(workspace_id, &raw_secret),
             Json(MetadataPatchRequest {
+                mode: None,
                 mime_type: Some(Some("text/plain".to_string())),
                 custom_attrs: BTreeMap::new(),
                 remove_custom_attrs: Vec::new(),
@@ -7894,6 +7964,7 @@ mod tests {
             Path("/open/legal-link.txt".to_string()),
             workspace_headers(workspace_id, &raw_secret),
             Json(MetadataPatchRequest {
+                mode: None,
                 mime_type: Some(Some("text/plain".to_string())),
                 custom_attrs: BTreeMap::new(),
                 remove_custom_attrs: Vec::new(),

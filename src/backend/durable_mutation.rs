@@ -545,6 +545,7 @@ struct RedactedMetadataUpdate<'a>(&'a MetadataUpdate);
 impl fmt::Debug for RedactedMetadataUpdate<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetadataUpdate")
+            .field("mode", &self.0.mode.map(|mode| format!("0{mode:o}")))
             .field("mime_type", &self.0.mime_type)
             .field("custom_attrs", &RedactedCustomAttrs(&self.0.custom_attrs))
             .field(
@@ -967,6 +968,15 @@ fn move_path(records: &mut PathMap, source: &str, destination: &str) -> Result<(
 }
 
 fn apply_metadata(record: &mut PathRecord, update: MetadataUpdate) -> Result<(), VfsError> {
+    if let Some(mode) = update.mode {
+        if mode > 0o7777 {
+            return Err(VfsError::InvalidArgs {
+                message: format!("invalid mode: 0{mode:o}"),
+            });
+        }
+        record.mode = mode;
+    }
+
     if let Some(mime_type) = &update.mime_type {
         if let Some(mime_type) = mime_type {
             validate_mime_type(mime_type)?;
@@ -2234,6 +2244,7 @@ mod tests {
             .await
             .unwrap();
         let metadata = MetadataUpdate {
+            mode: None,
             mime_type: Some(Some("text/plain".to_string())),
             custom_attrs: BTreeMap::from([("reviewed".to_string(), "true".to_string())]),
             remove_custom_attrs: Vec::new(),
@@ -2675,6 +2686,7 @@ mod tests {
         let metadata = DurableMutationOperation::SetMetadata {
             path: "/secret.txt".to_string(),
             update: MetadataUpdate {
+                mode: None,
                 mime_type: None,
                 custom_attrs: BTreeMap::from([(
                     "metadata-token".to_string(),

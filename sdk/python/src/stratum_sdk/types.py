@@ -47,6 +47,7 @@ class StratumMkdirResult(TypedDict):
 
 
 class StratumMetadataPatch(TypedDict, total=False):
+    mode: str
     mime_type: str | None
     custom_attrs: dict[str, str]
     remove_custom_attrs: list[str]
@@ -55,6 +56,8 @@ class StratumMetadataPatch(TypedDict, total=False):
 class StratumMetadataPatchResult(TypedDict):
     metadata_updated: str
     changed: bool
+    mode: str
+    mode_changed: bool
     mime_type: str | None
     custom_attr_keys: list[str]
     custom_attrs_set: list[str]
