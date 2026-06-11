@@ -8,8 +8,10 @@ blocked rather than simulated when operator credentials are unavailable.
 
 Local rehearsal passed on 2026-06-11 using a throwaway
 `/tmp/stratum-release-rehearsal.*` data directory and
-`CARGO_TARGET_DIR=/tmp/stratum-target-task16`. Raw CLI token output stayed in
-temporary logs and was removed by the cleanup trap.
+`CARGO_TARGET_DIR=/tmp/stratum-target-task16`. The same path then passed from a
+fresh clone of `origin/main` at `af5e7144968d1ef2ad0b7c18a0cb2f9a202bfc23`
+with a fresh temp data dir and temp Cargo target dir. Raw CLI token output
+stayed in temporary logs and was removed by the cleanup trap.
 
 Hosted durable rehearsal was not run. Required operator state was not available:
 Cloudflare deploy target, Postgres/R2 credentials, tenant/repo context, and a
@@ -27,12 +29,15 @@ repo-bound hosted admin bearer.
   `reviewPaths` for exact change-request file-view evidence.
 - `scripts/run-local-golden-path-demo.sh` handles empty optional repo headers
   under Bash `set -u`.
+- `scripts/run-local-golden-path-demo.sh` installs SDK dependencies when
+  `sdk/node_modules/.bin/tsc` is missing, so a fresh checkout has no hidden
+  dependency-install step.
 - Demo docs now match the actual `addagent` token transcript and `reviewPaths`
   flow.
 
 ## Verification
 
 - `scripts/run-local-golden-path-demo.sh` passed end to end in the temp local
-  rehearsal.
+  rehearsal and in a fresh clone of `origin/main`.
 - Focused Rust, TypeScript, and script checks are recorded in
   `docs/project-status.md`.

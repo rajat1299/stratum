@@ -4,9 +4,12 @@ Status: Task 16 / release rehearsal HITL, 2026-06-11.
 
 ## Local Golden Path
 
-The local-state private-beta rehearsal passed end to end in a throwaway
-`/tmp/stratum-release-rehearsal.*` data directory. Raw setup logs and token
-material stayed in `/tmp` and were removed by the cleanup trap.
+The local-state private-beta rehearsal passed end to end first in the active
+worktree with a throwaway `/tmp/stratum-release-rehearsal.*` data directory,
+then again from a fresh clone of `origin/main` at
+`af5e7144968d1ef2ad0b7c18a0cb2f9a202bfc23` with a fresh temp data dir and temp
+Cargo target dir. Raw setup logs and token material stayed in `/tmp` and were
+removed by the cleanup trap.
 
 Covered flow:
 
@@ -31,6 +34,8 @@ The rehearsal exposed and fixed four local blockers:
   agent paths
 - the Bash demo script had to tolerate an empty optional repo header under
   macOS Bash with `set -u`
+- a fresh checkout had no SDK dependencies installed, so the script now runs
+  `bun install` under `sdk/` when `sdk/node_modules/.bin/tsc` is missing
 
 ## Hosted Durable
 

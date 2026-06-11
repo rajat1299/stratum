@@ -23,13 +23,17 @@ Completed scope:
   `/tmp/stratum-release-rehearsal.*` data directory: admin setup, backing agent
   token, server, seed-demo, checked-in agent change request, file-view evidence,
   approval, merge, audit evidence, revert, and post-revert audit evidence.
+- Re-ran the same path from a fresh clone of `origin/main` at
+  `af5e7144968d1ef2ad0b7c18a0cb2f9a202bfc23`, with a fresh temp data dir and
+  fresh temp Cargo target dir.
 - Kept token-bearing setup logs in `/tmp` and removed them through the rehearsal
   cleanup trap.
 - Fixed rehearsal blockers found during the live pass: seed-demo now chmods the
   demo workspace root for scoped writes, the incident example requests diff
   preview by concrete commit IDs, the example returns exact `reviewPaths` for
-  file-view evidence, and the Bash script handles empty optional repo headers
-  under `set -u`.
+  file-view evidence, the Bash script handles empty optional repo headers under
+  `set -u`, and the demo script bootstraps SDK dependencies when `tsc` is
+  missing in a fresh checkout.
 - Updated demo docs to match the actual `addagent` token transcript and
   `reviewPaths` flow.
 - Recorded hosted durable rehearsal as blocked rather than simulated: no
@@ -39,7 +43,10 @@ Completed scope:
 
 Focused verification:
 
-- Full temp local rehearsal passed with `scripts/run-local-golden-path-demo.sh`.
+- Fresh-clone local rehearsal passed with `scripts/run-local-golden-path-demo.sh`
+  from `origin/main` at `af5e7144968d1ef2ad0b7c18a0cb2f9a202bfc23`.
+- Temp local rehearsal passed with `scripts/run-local-golden-path-demo.sh` from
+  the active worktree before the fresh-clone verification.
 - `CARGO_TARGET_DIR=/tmp/stratum-target-task16 cargo test --locked metadata_patch --lib -- --nocapture` passed **2** tests.
 - `CARGO_TARGET_DIR=/tmp/stratum-target-task16 cargo test --locked patch_fs_metadata_is_idempotent_and_audited_without_attr_values --lib -- --nocapture` passed **1** test.
 - `CARGO_TARGET_DIR=/tmp/stratum-target-task16 cargo test --locked seed_demo_ --bin stratumctl -- --nocapture` passed **14** tests.
