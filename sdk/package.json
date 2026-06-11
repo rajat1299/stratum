@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "build": "bun run --cwd typescript build && bun run --cwd bash build && bun run --cwd agents build",
+    "check:publishing": "node scripts/check-publishing-boundaries.mjs",
     "typecheck": "bun run --cwd typescript typecheck && bun run --cwd bash typecheck && bun run --cwd agents typecheck",
     "test:run": "bun run --cwd typescript test:run && bun run --cwd bash test:run && bun run --cwd agents test:run"
   }

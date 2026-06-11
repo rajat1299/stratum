@@ -1,4 +1,4 @@
-__version__ = "0.0.0"
+__version__ = "0.0.0b0"
 
 from stratum_sdk.client import (
     FilesystemClient,

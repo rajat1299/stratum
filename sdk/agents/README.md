@@ -1,12 +1,18 @@
 # @stratum/agents
 
-> **Beta.** First-party agent-framework adapters for mounted Stratum workspaces. APIs may change between beta releases. This package adds no backend capabilities and ships no publish automation.
+> **Beta.** First-party agent-framework adapters for mounted Stratum workspaces. APIs may change between beta releases. This package adds no backend capabilities; release remains a manual operator action.
 
 `@stratum/agents` lets OpenAI Agents, the Vercel AI SDK, LangChain/deepagents, and Mastra read, list, write, and edit files in a mounted Stratum workspace through `@stratum/sdk`, and run commands only through the Stratum `/execute` route when the workspace capability manifest enables execution. There is no host-shell fallback: when execution is unavailable, execute/shell tools fail explicitly.
 
 ## Install
 
-This slice does not publish `@stratum/agents`. In this repository, install from the SDK workspace and build locally:
+Install matching beta releases:
+
+```bash
+npm install @stratum/sdk@0.0.0-beta.0 @stratum/agents@0.0.0-beta.0
+```
+
+In this repository, install from the SDK workspace and build locally:
 
 ```bash
 cd sdk
@@ -14,7 +20,7 @@ bun install
 bun run build
 ```
 
-After package publication, install matching beta releases of `@stratum/agents` and `@stratum/sdk`, plus only the framework harness you use. Vercel and Mastra subpath adapters also require `zod`; OpenAI and LangChain/deepagents do not.
+Install only the framework harness you use. Vercel and Mastra subpath adapters also require `zod`; OpenAI and LangChain/deepagents do not.
 
 ## Supported target harness versions
 
@@ -112,7 +118,7 @@ Adapters do not log or surface tokens, environment variables, raw commands, raw 
 
 ## Out of scope
 
-- npm publish automation (this package is beta and built locally).
+- Automated npm publishing.
 - Live OpenAI / Vercel / LangChain / Mastra / model calls in tests.
 - Host-shell or local-process execution fallback.
 - Python adapters.

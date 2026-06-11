@@ -6,6 +6,15 @@ Synchronous Python client (`httpx`) for the **current** Stratum HTTP API. Mirror
 
 Requires **Python 3.11+**. This slice ships **sync only**—no async client yet.
 
+## Install
+
+```bash
+pip install stratum-sdk==0.0.0b0
+```
+
+The beta package version is tracked in `sdk/version-matrix.json`. Python uses
+PEP 440 beta spelling (`0.0.0b0`) while npm uses `0.0.0-beta.0`.
+
 ## Install from repo
 
 From the repo root (path may vary):

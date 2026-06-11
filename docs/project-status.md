@@ -6,11 +6,50 @@
 - Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
 - Latest completed backend slice: Conformance Test Scaffolding (Slice 24)
 - Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
-- Latest completed SDK slice: Agent Adapter Pack beta (`@stratum/agents`) with OpenAI/Vercel/LangChain/Mastra adapters over mounted workspaces and the gated `/execute` route (`docs/plans/2026-06-02-agent-adapter-pack.md`)
+- Latest completed SDK slice: SDK beta publishing readiness (`docs/plans/2026-06-11-sdk-beta-publishing.md`)
 - Postgres semantic search shipped for durable-cloud (`GET /search/semantic`, SDK `search.semantic`): Slice 20 adds FTS state/files (migration 0019); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); Slice 23 adds pgvector ranking as an additive derived index (migration 0022) with disabled-by-default providers and FTS fallback.
-- Planned next SDK slice: published package releases, optional async SDK
+- Planned next SDK slice: optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Task 14 / SDK Beta Publishing
+
+Delivered from `docs/plans/2026-06-11-sdk-beta-publishing.md`.
+
+Completed scope:
+
+- Added `sdk/version-matrix.json` as the private-beta package version source of
+  truth for `@stratum/sdk@0.0.0-beta.0`,
+  `@stratum/agents@0.0.0-beta.0`, and Python `stratum-sdk==0.0.0b0`.
+- Added `sdk/scripts/check-publishing-boundaries.mjs` to verify npm/PyPI package
+  names, versions, entrypoints, `dist`/Python package boundaries, exact
+  `@stratum/agents` dependency on `@stratum/sdk`, Python `py.typed`, and runtime
+  Python version parity.
+- Moved Python `stratum-sdk` to PEP 440 beta `0.0.0b0` across `pyproject.toml`,
+  runtime `__version__`, and package tests.
+- Added a Python package-boundary test and expanded CI from TypeScript-only SDK
+  checks to SDK package readiness: matrix check, TypeScript SDK typecheck/test/
+  build/pack, Agents typecheck/test/build/pack, and Python temp-venv test/build.
+- Added `docs/sdk-beta-publishing.md` with the manual release order and
+  token-free CI boundary, and updated SDK READMEs with matching beta install
+  commands.
+
+Focused verification:
+
+- `bun run --cwd sdk check:publishing` passed.
+- `bun run --cwd sdk typecheck` passed.
+- `bun run --cwd sdk test:run` passed: TypeScript SDK **68** passed / **1**
+  skipped, Bash SDK **47** passed / **1** skipped, Agents **68** passed.
+- `bun run --cwd sdk build` passed.
+- `npm pack --dry-run` passed for `sdk/typescript`
+  (`@stratum/sdk@0.0.0-beta.0`, **38** files) and `sdk/agents`
+  (`@stratum/agents@0.0.0-beta.0`, **54** files).
+- Python package verification in a temp `uv` virtualenv passed:
+  `python -m pytest sdk/python/tests -q` reported **44** passed / **1** skipped,
+  and `python -m build sdk/python --outdir /tmp/stratum-python-task14-dist`
+  produced `stratum_sdk-0.0.0b0.tar.gz` and
+  `stratum_sdk-0.0.0b0-py3-none-any.whl`.
+- `git diff --check` passed.
 
 ## Task 13 / Durable Deployment Runbook
 

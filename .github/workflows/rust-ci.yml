@@ -299,10 +299,10 @@ jobs:
           STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_BASE_DELAY_MS }}
           STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_MAX_DELAY_MS }}
 
-  typescript-sdk:
-    name: TypeScript SDK
+  sdk-packages:
+    name: SDK Packages
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -316,20 +316,40 @@ jobs:
       - name: Install SDK dependencies
         run: bun install --frozen-lockfile
         working-directory: sdk
-      - name: Typecheck TypeScript SDK
-        run: bun run --cwd typescript typecheck
+      - name: Verify SDK publishing matrix
+        run: bun run check:publishing
         working-directory: sdk
-      - name: Test TypeScript SDK
-        run: bun run --cwd typescript test:run
+      - name: Typecheck npm SDK packages
+        run: |
+          bun run --cwd typescript typecheck
+          bun run --cwd agents typecheck
         working-directory: sdk
-      - name: Build TypeScript SDK dist
-        run: bun run --cwd typescript build
+      - name: Test npm SDK packages
+        run: |
+          bun run --cwd typescript test:run
+          bun run --cwd agents test:run
         working-directory: sdk
-      - name: Verify TypeScript SDK dist build is clean
-        run: git diff --exit-code -- sdk/typescript
-      - name: Verify TypeScript SDK package boundary
+      - name: Build npm SDK package dists
+        run: |
+          bun run --cwd typescript build
+          bun run --cwd agents build
+        working-directory: sdk
+      - name: Verify npm SDK dist builds are clean
+        run: git diff --exit-code -- sdk/typescript sdk/agents
+      - name: Verify TypeScript SDK npm package boundary
         run: npm pack --dry-run
         working-directory: sdk/typescript
+      - name: Verify Agents npm package boundary
+        run: npm pack --dry-run
+        working-directory: sdk/agents
+      - name: Test and build Python SDK package
+        run: |
+          python3 -m venv "$RUNNER_TEMP/stratum-python-venv"
+          "$RUNNER_TEMP/stratum-python-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/stratum-python-venv/bin/python" -m pip install -e ".[dev]"
+          "$RUNNER_TEMP/stratum-python-venv/bin/python" -m pytest -q
+          "$RUNNER_TEMP/stratum-python-venv/bin/python" -m build --outdir "$RUNNER_TEMP/stratum-python-dist"
+        working-directory: sdk/python
 
   test:
     name: Tests

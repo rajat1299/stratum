@@ -4,6 +4,14 @@ TypeScript SDK for the current Stratum HTTP API.
 
 `@stratum/sdk` is the reusable client layer for applications, agents, CLIs, and higher-level packages such as `@stratum/bash`. It keeps Stratum's Rust server as the source of truth and wraps the implemented HTTP routes without inventing future backend behavior.
 
+## Install
+
+```bash
+npm install @stratum/sdk@0.0.0-beta.0
+```
+
+The beta package version is tracked in `sdk/version-matrix.json`.
+
 ## Usage
 
 Workspace bearer auth for workspace-scoped filesystem, search, and run-record routes:

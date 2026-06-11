@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "revision": "2026-06-11-1",
+  "release_channel": "private-beta",
+  "packages": [
+    {
+      "name": "@stratum/sdk",
+      "ecosystem": "npm",
+      "path": "typescript",
+      "version": "0.0.0-beta.0",
+      "registry": "npm",
+      "tag": "beta",
+      "entrypoints": ["."],
+      "files": ["dist"]
+    },
+    {
+      "name": "@stratum/agents",
+      "ecosystem": "npm",
+      "path": "agents",
+      "version": "0.0.0-beta.0",
+      "registry": "npm",
+      "tag": "beta",
+      "depends_on": {
+        "@stratum/sdk": "0.0.0-beta.0"
+      },
+      "entrypoints": [".", "./openai", "./vercel", "./langchain", "./mastra"],
+      "files": ["dist", "README.md"]
+    },
+    {
+      "name": "stratum-sdk",
+      "ecosystem": "pypi",
+      "path": "python",
+      "version": "0.0.0b0",
+      "registry": "pypi",
+      "python_import": "stratum_sdk",
+      "files": ["src/stratum_sdk", "README.md", "LICENSE", "pyproject.toml"]
+    }
+  ]
+}
