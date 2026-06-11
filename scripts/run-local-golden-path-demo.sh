@@ -19,6 +19,11 @@ require_command bun
 require_command curl
 require_command jq
 
+if [[ ! -x sdk/node_modules/.bin/tsc ]]; then
+  printf 'Installing SDK dependencies...\n'
+  (cd sdk && bun install)
+fi
+
 : "${STRATUM_AGENT_TOKEN:?Set STRATUM_AGENT_TOKEN to the backing token printed by addagent.}"
 export STRATUM_AGENT_TOKEN
 
