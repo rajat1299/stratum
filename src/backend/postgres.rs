@@ -91,8 +91,8 @@ use crate::review::{
     ChangeRequest, ChangeRequestStatus, DismissApprovalInput, NewApprovalRecord, NewChangeRequest,
     NewReviewAssignment, NewReviewComment, ProtectedPathRule, ProtectedRefRule, ReviewAssignment,
     ReviewAssignmentMutation, ReviewComment, ReviewCommentKind, ReviewCommentMutation, ReviewStore,
-    SetViewedFileInput, ViewedFileMutation, ViewedFileRecord, normalize_path_prefix,
-    normalize_dismissal_reason, validate_change_request_open,
+    SetViewedFileInput, ViewedFileMutation, ViewedFileRecord, normalize_dismissal_reason,
+    normalize_path_prefix, validate_change_request_open,
 };
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{ChangedPath, CommitId, MAIN_REF, RefName};
@@ -9126,12 +9126,13 @@ impl ReviewStore for PostgresMetadataStore {
             });
         }
 
-        let next_version = existing
-            .version
-            .checked_add(1)
-            .ok_or_else(|| VfsError::InvalidArgs {
-                message: "viewed file version overflow".to_string(),
-            })?;
+        let next_version =
+            existing
+                .version
+                .checked_add(1)
+                .ok_or_else(|| VfsError::InvalidArgs {
+                    message: "viewed file version overflow".to_string(),
+                })?;
         let next_version_i64 = u64_to_i64(next_version, "viewed file version")?;
         let updated_row = tx
             .query_one(
@@ -18276,12 +18277,10 @@ mod tests {
                 return;
             };
             let store = &db.store;
-            let change = ReviewStore::create_change_request(
-                store,
-                postgres_viewed_file_change_request(10),
-            )
-            .await
-            .expect("create change request");
+            let change =
+                ReviewStore::create_change_request(store, postgres_viewed_file_change_request(10))
+                    .await
+                    .expect("create change request");
 
             let mutation = ReviewStore::set_viewed_file(
                 store,
@@ -18316,12 +18315,10 @@ mod tests {
                 return;
             };
             let store = &db.store;
-            let change = ReviewStore::create_change_request(
-                store,
-                postgres_viewed_file_change_request(10),
-            )
-            .await
-            .expect("create change request");
+            let change =
+                ReviewStore::create_change_request(store, postgres_viewed_file_change_request(10))
+                    .await
+                    .expect("create change request");
             let input = SetViewedFileInput {
                 change_request_id: change.id,
                 path: "/contracts/a.md".to_string(),
@@ -18351,12 +18348,10 @@ mod tests {
                 return;
             };
             let store = &db.store;
-            let change = ReviewStore::create_change_request(
-                store,
-                postgres_viewed_file_change_request(10),
-            )
-            .await
-            .expect("create change request");
+            let change =
+                ReviewStore::create_change_request(store, postgres_viewed_file_change_request(10))
+                    .await
+                    .expect("create change request");
 
             ReviewStore::set_viewed_file(
                 store,

@@ -1116,6 +1116,7 @@ function DiffSection({
     isTerminal || viewedFiles.isLoading || viewedFiles.isError || setViewed.isPending;
 
   function isPathViewed(path: string): boolean {
+    if (!viewedFiles.isSuccess) return false;
     return !unviewedPaths.includes(path);
   }
 

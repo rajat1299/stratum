@@ -691,8 +691,7 @@ async fn viewed_files_json(
         .review
         .list_viewed_files_for_repo(&change.repo_id, change.id, viewed_by)
         .await?;
-    let mut required_paths = changed_paths;
-    required_paths.sort();
+    let required_paths = sorted_unique_paths(changed_paths);
     let viewed_true_paths = viewed_records
         .iter()
         .filter(|record| record.head_commit == change.head_commit && record.viewed)
@@ -715,6 +714,14 @@ async fn viewed_files_json(
         "require_all_files_viewed": approval_state.require_all_files_viewed,
         "approval_state": approval_state_value(&approval_state),
     }))
+}
+
+fn sorted_unique_paths(paths: impl IntoIterator<Item = String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn mutation_committed_failure_body(
@@ -1962,11 +1969,7 @@ async fn set_change_request_viewed_file(
     let path = req.path.trim().to_string();
     if path.is_empty() || path == "/" || !path.starts_with('/') {
         abort_review_idempotency(&state, reservation.as_ref()).await;
-        return err_json(
-            StatusCode::BAD_REQUEST,
-            format!("invalid path {path}"),
-        )
-        .into_response();
+        return err_json(StatusCode::BAD_REQUEST, format!("invalid path {path}")).into_response();
     }
     if !changed_paths.iter().any(|changed| changed == &path) {
         abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -2002,8 +2005,7 @@ async fn set_change_request_viewed_file(
             if let Some(object) = body.as_object_mut() {
                 object.insert(
                     "viewed_file".to_string(),
-                    serde_json::to_value(&mutation.record)
-                        .expect("viewed file record serializes"),
+                    serde_json::to_value(&mutation.record).expect("viewed file record serializes"),
                 );
                 object.insert(
                     "updated".to_string(),
@@ -2014,10 +2016,7 @@ async fn set_change_request_viewed_file(
                 let event = review_mutation_audit_event(
                     &session,
                     AuditAction::ChangeRequestFileView,
-                    AuditResource::id(
-                        AuditResourceKind::ChangeRequest,
-                        change.id.to_string(),
-                    ),
+                    AuditResource::id(AuditResourceKind::ChangeRequest, change.id.to_string()),
                     SET_CHANGE_REQUEST_VIEWED_FILE_ROUTE,
                     &change,
                     reservation.as_ref(),
@@ -2659,10 +2658,6 @@ async fn merge_change_request(
             }),
         );
     }
-    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
-        abort_review_idempotency(&state, reservation.as_ref()).await;
-        return response;
-    }
     if approval_state.require_all_files_viewed {
         let viewed_records = match state
             .review
@@ -2684,8 +2679,7 @@ async fn merge_change_request(
             .filter(|record| record.head_commit == change.head_commit && record.viewed)
             .map(|record| record.path.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut required_paths = changed_paths.clone();
-        required_paths.sort();
+        let required_paths = sorted_unique_paths(changed_paths.clone());
         let unviewed_paths = required_paths
             .iter()
             .filter(|path| !viewed_true_paths.contains(path.as_str()))
@@ -2707,6 +2701,10 @@ async fn merge_change_request(
                 }),
             );
         }
+    }
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return response;
     }
     let review_policy_token =
         match PolicyDecisionToken::from_review_approved_evaluation(&policy_evaluation) {
@@ -4223,13 +4221,8 @@ mod tests {
     }
 
     async fn mark_review_fixture_files_viewed(state: &AppState, change_id: Uuid, username: &str) {
-        mark_change_request_file_viewed(
-            state,
-            user_headers(username),
-            change_id,
-            "/legal.txt",
-        )
-        .await;
+        mark_change_request_file_viewed(state, user_headers(username), change_id, "/legal.txt")
+            .await;
     }
 
     async fn mark_review_fixture_files_viewed_for_repo(
@@ -7871,15 +7864,18 @@ mod tests {
             .unwrap();
         approve_change_request_for(&state, id, "alice").await;
 
-        let blocked = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
-            .await
-            .into_response();
+        let blocked =
+            merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
         assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
         let blocked_body = response_json(blocked).await;
-        assert!(blocked_body["error"]
-            .as_str()
-            .unwrap()
-            .contains("requires all changed files to be viewed"));
+        assert!(
+            blocked_body["error"]
+                .as_str()
+                .unwrap()
+                .contains("requires all changed files to be viewed")
+        );
         assert_eq!(
             blocked_body["required_paths"],
             serde_json::json!(["/legal.txt"])
@@ -7891,6 +7887,12 @@ mod tests {
         assert_eq!(blocked_body["all_required_files_viewed"], false);
         assert_eq!(blocked_body["require_all_files_viewed"], true);
         assert_eq!(blocked_body["approval_state"]["approved"], true);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| event.action != AuditAction::PolicyDecisionAllow)
+        );
     }
 
     #[tokio::test]

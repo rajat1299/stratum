@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 import httpx
+
 from stratum_sdk import StratumClient, UserAuth
 
 CONFORMANCE_FIXTURE = (
@@ -58,9 +59,7 @@ def test_python_sdk_maps_get_capabilities_to_fixture() -> None:
         client = StratumClient("https://stratum.example/", http_client=raw)
 
         mapped_methods = [
-            case["sdk"]["python"]
-            for case in fixture["cases"]
-            if case["sdk"]["python"] is not None
+            case["sdk"]["python"] for case in fixture["cases"] if case["sdk"]["python"] is not None
         ]
         assert "get_capabilities" in mapped_methods
         assert "write_file" in mapped_methods

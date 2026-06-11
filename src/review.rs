@@ -822,10 +822,7 @@ impl ViewedFileRecord {
     pub(crate) fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
         if self.version == 0 {
             return Err(VfsError::CorruptStore {
-                message: format!(
-                    "viewed file {} has zero version",
-                    self.path
-                ),
+                message: format!("viewed file {} has zero version", self.path),
             });
         }
         validate_commit_hex(&self.head_commit)?;
@@ -1171,12 +1168,13 @@ impl ReviewState {
                     updated: false,
                 });
             }
-            let next_version = record
-                .version
-                .checked_add(1)
-                .ok_or_else(|| VfsError::InvalidArgs {
-                    message: "viewed file version overflow".to_string(),
-                })?;
+            let next_version =
+                record
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| VfsError::InvalidArgs {
+                        message: "viewed file version overflow".to_string(),
+                    })?;
             let record = ViewedFileRecord {
                 change_request_id: input.change_request_id,
                 head_commit: change.head_commit.clone(),
@@ -1825,158 +1823,156 @@ impl LocalReviewStore {
                 }
                 persisted
             }
-            Err(v4_error) => {
-                match crate::codec::deserialize::<PersistedReviewStoreV4>(bytes) {
-                    Ok(v4) => {
-                        if v4.version != 4 {
-                            return Err(VfsError::CorruptStore {
-                                message: format!("unsupported review store version {}", v4.version),
-                            });
-                        }
-                        v4.into()
+            Err(v4_error) => match crate::codec::deserialize::<PersistedReviewStoreV4>(bytes) {
+                Ok(v4) => {
+                    if v4.version != 4 {
+                        return Err(VfsError::CorruptStore {
+                            message: format!("unsupported review store version {}", v4.version),
+                        });
                     }
-                    Err(_) => {
-                        match crate::codec::deserialize::<PersistedReviewStoreWithoutFileViewed>(
-                            bytes,
-                        ) {
-                            Ok(v4) => {
-                                if v4.version != 4 {
-                                    return Err(VfsError::CorruptStore {
-                                        message: format!(
-                                            "unsupported review store version {}",
-                                            v4.version
-                                        ),
-                                    });
-                                }
-                                v4.into()
+                    v4.into()
+                }
+                Err(_) => {
+                    match crate::codec::deserialize::<PersistedReviewStoreWithoutFileViewed>(bytes)
+                    {
+                        Ok(v4) => {
+                            if v4.version != 4 {
+                                return Err(VfsError::CorruptStore {
+                                    message: format!(
+                                        "unsupported review store version {}",
+                                        v4.version
+                                    ),
+                                });
                             }
-                            Err(_) => {
-                                match crate::codec::deserialize::<PersistedReviewStoreV3>(bytes) {
-                                    Ok(v3) => {
-                                        if v3.version != 3 {
-                                            return Err(VfsError::CorruptStore {
-                                                message: format!(
-                                                    "unsupported review store version {}",
-                                                    v3.version
-                                                ),
-                                            });
-                                        }
-                                        PersistedReviewStore {
-                                            version: REVIEW_STORE_VERSION,
-                                            protected_refs: v3.protected_refs,
-                                            protected_paths: v3.protected_paths,
-                                            change_requests: v3.change_requests,
-                                            approvals: v3.approvals,
-                                            assignments: Vec::new(),
-                                            comments: v3.comments,
-                                            viewed_files: Vec::new(),
-                                        }
+                            v4.into()
+                        }
+                        Err(_) => {
+                            match crate::codec::deserialize::<PersistedReviewStoreV3>(bytes) {
+                                Ok(v3) => {
+                                    if v3.version != 3 {
+                                        return Err(VfsError::CorruptStore {
+                                            message: format!(
+                                                "unsupported review store version {}",
+                                                v3.version
+                                            ),
+                                        });
                                     }
-                                    Err(_) => {
-                                        match crate::codec::deserialize::<
-                                            PersistedReviewStoreV3WithoutFileViewed,
-                                        >(bytes)
-                                        {
-                                            Ok(v3) => {
-                                                if v3.version != 3 {
-                                                    return Err(VfsError::CorruptStore {
-                                                        message: format!(
-                                                            "unsupported review store version {}",
-                                                            v3.version
-                                                        ),
-                                                    });
-                                                }
-                                                PersistedReviewStore {
-                                                    version: REVIEW_STORE_VERSION,
-                                                    protected_refs: v3
-                                                        .protected_refs
-                                                        .into_iter()
-                                                        .map(Into::into)
-                                                        .collect(),
-                                                    protected_paths: v3
-                                                        .protected_paths
-                                                        .into_iter()
-                                                        .map(Into::into)
-                                                        .collect(),
-                                                    change_requests: v3.change_requests,
-                                                    approvals: v3.approvals,
-                                                    assignments: Vec::new(),
-                                                    comments: v3.comments,
-                                                    viewed_files: Vec::new(),
-                                                }
+                                    PersistedReviewStore {
+                                        version: REVIEW_STORE_VERSION,
+                                        protected_refs: v3.protected_refs,
+                                        protected_paths: v3.protected_paths,
+                                        change_requests: v3.change_requests,
+                                        approvals: v3.approvals,
+                                        assignments: Vec::new(),
+                                        comments: v3.comments,
+                                        viewed_files: Vec::new(),
+                                    }
+                                }
+                                Err(_) => {
+                                    match crate::codec::deserialize::<
+                                        PersistedReviewStoreV3WithoutFileViewed,
+                                    >(bytes)
+                                    {
+                                        Ok(v3) => {
+                                            if v3.version != 3 {
+                                                return Err(VfsError::CorruptStore {
+                                                    message: format!(
+                                                        "unsupported review store version {}",
+                                                        v3.version
+                                                    ),
+                                                });
                                             }
-                                            Err(_) => {
-                                                match crate::codec::deserialize::<
-                                                    PersistedReviewStoreV2,
-                                                >(bytes)
-                                                {
-                                                    Ok(v2) => {
-                                                        if v2.version != 2 {
-                                                            return Err(VfsError::CorruptStore {
-                                                                message: format!(
-                                                                    "unsupported review store version {}",
-                                                                    v2.version
-                                                                ),
-                                                            });
-                                                        }
-                                                        PersistedReviewStore {
-                                                            version: REVIEW_STORE_VERSION,
-                                                            protected_refs: v2
-                                                                .protected_refs
-                                                                .into_iter()
-                                                                .map(Into::into)
-                                                                .collect(),
-                                                            protected_paths: v2
-                                                                .protected_paths
-                                                                .into_iter()
-                                                                .map(Into::into)
-                                                                .collect(),
-                                                            change_requests: v2.change_requests,
-                                                            approvals: v2
-                                                                .approvals
-                                                                .into_iter()
-                                                                .map(ApprovalRecord::from)
-                                                                .collect(),
-                                                            assignments: Vec::new(),
-                                                            comments: Vec::new(),
-                                                            viewed_files: Vec::new(),
-                                                        }
-                                                    }
-                                                    Err(_) => {
-                                                        let v1 = crate::codec::deserialize::<
-                                                            PersistedReviewStoreV1,
-                                                        >(bytes)
-                                                        .map_err(|_| VfsError::CorruptStore {
+                                            PersistedReviewStore {
+                                                version: REVIEW_STORE_VERSION,
+                                                protected_refs: v3
+                                                    .protected_refs
+                                                    .into_iter()
+                                                    .map(Into::into)
+                                                    .collect(),
+                                                protected_paths: v3
+                                                    .protected_paths
+                                                    .into_iter()
+                                                    .map(Into::into)
+                                                    .collect(),
+                                                change_requests: v3.change_requests,
+                                                approvals: v3.approvals,
+                                                assignments: Vec::new(),
+                                                comments: v3.comments,
+                                                viewed_files: Vec::new(),
+                                            }
+                                        }
+                                        Err(_) => {
+                                            match crate::codec::deserialize::<PersistedReviewStoreV2>(
+                                                bytes,
+                                            ) {
+                                                Ok(v2) => {
+                                                    if v2.version != 2 {
+                                                        return Err(VfsError::CorruptStore {
                                                             message: format!(
-                                                                "review store decode failed: {v4_error}"
+                                                                "unsupported review store version {}",
+                                                                v2.version
                                                             ),
-                                                        })?;
-                                                        if v1.version != 1 {
-                                                            return Err(VfsError::CorruptStore {
-                                                                message: format!(
-                                                                    "unsupported review store version {}",
-                                                                    v1.version
-                                                                ),
-                                                            });
-                                                        }
-                                                        PersistedReviewStore {
-                                                            version: REVIEW_STORE_VERSION,
-                                                            protected_refs: v1
-                                                                .protected_refs
-                                                                .into_iter()
-                                                                .map(Into::into)
-                                                                .collect(),
-                                                            protected_paths: v1
-                                                                .protected_paths
-                                                                .into_iter()
-                                                                .map(Into::into)
-                                                                .collect(),
-                                                            change_requests: v1.change_requests,
-                                                            approvals: Vec::new(),
-                                                            assignments: Vec::new(),
-                                                            comments: Vec::new(),
-                                                            viewed_files: Vec::new(),
-                                                        }
+                                                        });
+                                                    }
+                                                    PersistedReviewStore {
+                                                        version: REVIEW_STORE_VERSION,
+                                                        protected_refs: v2
+                                                            .protected_refs
+                                                            .into_iter()
+                                                            .map(Into::into)
+                                                            .collect(),
+                                                        protected_paths: v2
+                                                            .protected_paths
+                                                            .into_iter()
+                                                            .map(Into::into)
+                                                            .collect(),
+                                                        change_requests: v2.change_requests,
+                                                        approvals: v2
+                                                            .approvals
+                                                            .into_iter()
+                                                            .map(ApprovalRecord::from)
+                                                            .collect(),
+                                                        assignments: Vec::new(),
+                                                        comments: Vec::new(),
+                                                        viewed_files: Vec::new(),
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    let v1 = crate::codec::deserialize::<
+                                                        PersistedReviewStoreV1,
+                                                    >(
+                                                        bytes
+                                                    )
+                                                    .map_err(|_| VfsError::CorruptStore {
+                                                        message: format!(
+                                                            "review store decode failed: {v4_error}"
+                                                        ),
+                                                    })?;
+                                                    if v1.version != 1 {
+                                                        return Err(VfsError::CorruptStore {
+                                                            message: format!(
+                                                                "unsupported review store version {}",
+                                                                v1.version
+                                                            ),
+                                                        });
+                                                    }
+                                                    PersistedReviewStore {
+                                                        version: REVIEW_STORE_VERSION,
+                                                        protected_refs: v1
+                                                            .protected_refs
+                                                            .into_iter()
+                                                            .map(Into::into)
+                                                            .collect(),
+                                                        protected_paths: v1
+                                                            .protected_paths
+                                                            .into_iter()
+                                                            .map(Into::into)
+                                                            .collect(),
+                                                        change_requests: v1.change_requests,
+                                                        approvals: Vec::new(),
+                                                        assignments: Vec::new(),
+                                                        comments: Vec::new(),
+                                                        viewed_files: Vec::new(),
                                                     }
                                                 }
                                             }
@@ -1987,7 +1983,7 @@ impl LocalReviewStore {
                         }
                     }
                 }
-            }
+            },
         };
 
         let mut ids = HashSet::new();

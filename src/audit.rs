@@ -145,7 +145,7 @@ impl AuditExportClass {
             AuditAction::ChangeRequestCreate
             | AuditAction::ChangeRequestApprove
             | AuditAction::ChangeRequestApprovalDismiss
-            |             AuditAction::ChangeRequestCommentCreate
+            | AuditAction::ChangeRequestCommentCreate
             | AuditAction::ChangeRequestFileView
             | AuditAction::ChangeRequestReviewerAssign
             | AuditAction::ChangeRequestReject
