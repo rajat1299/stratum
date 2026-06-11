@@ -12,6 +12,43 @@
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
+## Task 13 / Durable Deployment Runbook
+
+Delivered from `docs/plans/2026-06-11-durable-deployment-runbook.md`, grounded
+in the private-beta contract, HTTP API durable-cloud posture, live provider gate
+scripts, and durable capability manifest.
+
+Completed scope:
+
+- Added `docs/durable-deployment-runbook.md` as the single private-beta
+  Cloudflare/Postgres/R2 posture for `STRATUM_BACKEND=durable` and
+  `STRATUM_CORE_RUNTIME=durable-cloud`.
+- Documented secret handling, `.env.live-gates` boundaries, runtime/readiness
+  env vars, idempotency quotas, Postgres pool/timeout posture, R2 retry posture,
+  migration `status|apply|adopt` behavior, live gates, health/capability
+  evidence, unsupported route checks, rollback, and signoff evidence.
+- Added `scripts/check-durable-deployment-runbook.sh` so the runbook contract is
+  locally verifiable without reading live secrets.
+- Updated the rollback-only Postgres migration smoke catalog to include
+  migration `0023_review_viewed_files.sql`, so the existing migration gate does
+  not fail before provider skip/required handling.
+- Linked the durable deployment runbook from the private-beta contract operator
+  notes.
+
+Focused verification:
+
+- `bash -n scripts/check-durable-deployment-runbook.sh` passed.
+- `./scripts/check-durable-deployment-runbook.sh` passed.
+- `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` exited zero
+  and skipped live Postgres because the test URL was unset.
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` exited zero and
+  skipped live R2 because the live gate was unset.
+- `STRATUM_LIVE_GATE_REQUIRED= ./scripts/ci-live-durable-cloud-gate.sh`,
+  `STRATUM_LIVE_GATE_REQUIRED= ./scripts/ci-live-postgres-gate.sh`, and
+  `STRATUM_LIVE_GATE_REQUIRED= ./scripts/ci-live-r2-gate.sh` exited zero and
+  reported `skipped live` without provider credentials.
+- `git diff --check` passed.
+
 ## Task 12 / Revert Rollback Closure
 
 Delivered from `docs/plans/2026-06-11-revert-rollback-closure.md`, grounded in

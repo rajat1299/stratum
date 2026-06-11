@@ -1297,5 +1297,6 @@ SELECT assert_true(
 \ir ../../migrations/postgres/0020_acl_snapshot_filtering.sql
 \ir ../../migrations/postgres/0021_file_extractors.sql
 \ir ../../migrations/postgres/0022_pgvector_semantic_expansion.sql
+\ir ../../migrations/postgres/0023_review_viewed_files.sql
 
 ROLLBACK;

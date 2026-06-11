@@ -135,6 +135,9 @@ The implementation plan for durable workspace and token parity is tracked in
 
 ## Operator Notes
 
+- The durable deployment posture, live Cloudflare/Postgres/R2 gate sequence,
+  unsupported-route checks, and rollback checklist live in
+  `docs/durable-deployment-runbook.md`.
 - Do not paste, log, screenshot, or check in raw tokens, token hashes, refresh
   tokens, SCIM bearer values, SAML assertions, OIDC codes, DB URLs, or request
   bodies that may contain secrets.
